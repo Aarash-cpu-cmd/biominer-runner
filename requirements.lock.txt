@@ -11,3 +11,13 @@ psutil==7.1.3
 # Pathway analysis: prerank only; the version is pinned because NES/FDR
 # values are engine-specific.
 gseapy==1.3.0
+# Connector (biominer_client): HTTPS tool calls + byte tickets. httpx and
+# its transport stack are pinned so the client tests run in CI.
+httpx==0.28.1
+httpcore==1.0.9
+anyio==4.14.2
+h11==0.16.0
+sniffio==1.3.1
+idna==3.18
+certifi==2026.7.22
+typing_extensions==4.16.0
