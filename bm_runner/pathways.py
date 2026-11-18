@@ -132,17 +132,31 @@ def _read_symbols(path: Path | None) -> pd.Series | None:
         return None
     if not path.is_file():
         raise Refusal("SYMBOLS_INVALID", "gene symbol file does not exist")
-    frame = pd.read_csv(path, sep="\t", dtype=str)
+    # keep_default_na=False keeps literal tokens ("NA"/"None"/"NaN") as strings
+    # rather than float NaN, which would break the downstream .str operations.
+    frame = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
     if "gene_id" not in frame.columns or "gene_symbol" not in frame.columns:
         raise Refusal("SYMBOLS_INVALID",
                       "gene symbol table needs gene_id and gene_symbol")
-    series = frame.set_index("gene_id")["gene_symbol"].astype(str).str.strip()
-    return series[series.ne("") & series.ne("nan")]
+    series = frame.set_index("gene_id")["gene_symbol"].str.strip()
+    missing = {"", "nan", "na", "none", "null", "n/a"}
+    series = series[~series.str.lower().isin(missing)]
+    series = series[series.index.astype(str).str.strip() != ""]
+    # One symbol per gene_id (keep first); a duplicate index would otherwise
+    # raise on reindex in _labels. Mirrors the ranking keep-first dedup policy.
+    return series[~series.index.duplicated(keep="first")]
 
 
 def _labels(genes: pd.Series, symbols: pd.Series | None, species: str) -> pd.Series:
-    labels = (symbols.reindex(genes.astype(str)).fillna(genes.astype(str))
-              if symbols is not None else genes.astype(str))
+    genes = genes.astype(str)
+    if symbols is None or len(symbols) == 0:
+        labels = genes.copy()
+    else:
+        symbols = symbols[~symbols.index.duplicated(keep="first")]
+        labels = symbols.reindex(genes).fillna(genes)
+    # Force string dtype: an all-missing mapping can leave a float dtype that
+    # would otherwise raise on the .str accessor below.
+    labels = labels.astype(str).str.strip()
     return labels if species != "human" else labels.str.upper()
 
 
@@ -200,6 +214,10 @@ def run_gsea(de_table_path: Path, gene_sets_path: Path, out_dir: Path, *,
     manifest = _verify_manifest(manifest_path, gene_set)
 
     rank, mapping = _build_rank(de_table, symbols, species)
+    if rank.empty:
+        raise Refusal("GSEA_EMPTY_RANKING",
+                      "no gene has a finite ranking statistic; GSEA cannot run",
+                      {"n_genes_in_de_table": int(len(de_table))})
     mapping["gene_set_mapping_rate"] = _gmtset_mapping(rank, terms)
     rank.to_csv(out_dir / "ranking.tsv", sep="\t", header=False)
 
@@ -216,17 +234,26 @@ def run_gsea(de_table_path: Path, gene_sets_path: Path, out_dir: Path, *,
 
     sampler = _RssSampler()
     with sampler:
-        result = gp.prerank(
-            rnk=rank,
-            gene_sets=str(gene_sets_path),
-            outdir=None,
-            permutation_num=int(permutations),
-            seed=int(seed),
-            min_size=int(min_size),
-            max_size=int(max_size),
-            threads=THREADS,
-            verbose=False,
-        )
+        try:
+            result = gp.prerank(
+                rnk=rank,
+                gene_sets=str(gene_sets_path),
+                outdir=None,
+                permutation_num=int(permutations),
+                seed=int(seed),
+                min_size=int(min_size),
+                max_size=int(max_size),
+                threads=THREADS,
+                verbose=False,
+            )
+        except LookupError as exc:
+            # gseapy raises LookupError when no gene set survives the size /
+            # mapping filter; refuse cleanly instead of an INTERNAL_ERROR crash.
+            raise Refusal(
+                "GSEA_NO_TESTABLE_TERMS",
+                "no gene set passed the size/mapping filter for this ranking",
+                {"n_genes_in_ranking": int(len(rank)),
+                 "detail": str(exc).splitlines()[0]}) from exc
     results = result.res2d.copy()
 
     results_path = out_dir / "gsea_results.tsv"

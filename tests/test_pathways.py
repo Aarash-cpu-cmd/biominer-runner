@@ -182,6 +182,84 @@ def test_cli_gsea_and_ora_dispatch(tmp_path):
     assert (tmp_path / "cli_ora" / "ora_results.tsv").is_file()
 
 
+def _write_gmt(root: Path, terms: dict[str, list[str]]) -> Path:
+    path = root / "custom.gmt"
+    path.write_text("\n".join(
+        "\t".join([name, "synthetic", *genes]) for name, genes in terms.items()
+    ) + "\n", encoding="utf-8")
+    return path
+
+
+def test_gsea_empty_ranking_is_refused(tmp_path):
+    """All-NaN stat leaves an empty ranking; refuse cleanly, do not crash."""
+    library = _write_library(tmp_path)
+    de_table, _symbols, _manifest = _write_inputs(tmp_path)
+    frame = pd.read_csv(de_table, sep="\t")
+    frame["stat"] = np.nan
+    frame.to_csv(de_table, sep="\t", index=False)
+    with pytest.raises(P.Refusal) as exc:
+        P.run_gsea(de_table, library, tmp_path / "out", permutations=50)
+    assert exc.value.code == "GSEA_EMPTY_RANKING"
+
+
+def test_gsea_zero_gmt_overlap_is_refused(tmp_path):
+    """Ranking genes disjoint from every gene set -> clean refusal."""
+    de_table, _symbols, _manifest = _write_inputs(tmp_path)
+    library = _write_gmt(tmp_path, {
+        "TERM_A": [f"X{i:04d}" for i in range(20)],
+        "TERM_B": [f"X{i:04d}" for i in range(20, 40)],
+    })
+    with pytest.raises(P.Refusal) as exc:
+        P.run_gsea(de_table, library, tmp_path / "out", permutations=50)
+    assert exc.value.code == "GSEA_NO_TESTABLE_TERMS"
+
+
+def test_gsea_all_terms_below_min_size_is_refused(tmp_path):
+    """Every gene set smaller than min_size -> clean refusal, not a crash."""
+    de_table, _symbols, _manifest = _write_inputs(tmp_path)
+    library = _write_gmt(tmp_path, {
+        "SMALL_A": [f"G{i:04d}" for i in range(5)],
+        "SMALL_B": [f"G{i:04d}" for i in range(5, 10)],
+    })
+    with pytest.raises(P.Refusal) as exc:
+        P.run_gsea(de_table, library, tmp_path / "out", permutations=50)
+    assert exc.value.code == "GSEA_NO_TESTABLE_TERMS"
+
+
+def test_ora_symbols_with_na_tokens_still_works(tmp_path):
+    """Literal NA/None/NaN symbol tokens must not crash the .str pipeline."""
+    library = _write_library(tmp_path)
+    de_table, symbols, _manifest = _write_inputs(tmp_path)
+    frame = pd.read_csv(symbols, sep="\t", dtype=str, keep_default_na=False)
+    for gene, token in (("G0100", "NA"), ("G0101", "None"),
+                        ("G0102", "NaN"), ("G0103", "  ")):
+        frame.loc[frame["gene_id"] == gene, "gene_symbol"] = token
+    frame.to_csv(symbols, sep="\t", index=False)
+    prov = P.run_ora(de_table, library, tmp_path / "out",
+                     gene_symbols_path=symbols)
+    assert prov["result_kind"] == "ora"
+    table = pd.read_csv(tmp_path / "out" / "ora_results.tsv", sep="\t")
+    up = table[(table["direction"] == "up") & (table["term"] == "UP_PATH")].iloc[0]
+    assert up["padj"] < 0.05
+
+
+def test_ora_duplicate_gene_id_symbols_keep_first(tmp_path):
+    """A duplicate gene_id in the symbol table must dedup, not raise on reindex."""
+    library = _write_library(tmp_path)
+    de_table, symbols, _manifest = _write_inputs(tmp_path)
+    frame = pd.read_csv(symbols, sep="\t", dtype=str, keep_default_na=False)
+    dup = pd.DataFrame([{"gene_id": "G0000", "gene_symbol": "DUP-SYM"}])
+    pd.concat([frame, dup], ignore_index=True).to_csv(symbols, sep="\t", index=False)
+    prov = P.run_ora(de_table, library, tmp_path / "out",
+                     gene_symbols_path=symbols)
+    assert prov["result_kind"] == "ora"
+    table = pd.read_csv(tmp_path / "out" / "ora_results.tsv", sep="\t")
+    up = table[(table["direction"] == "up") & (table["term"] == "UP_PATH")].iloc[0]
+    # keep-first maps G0000 back to SYM-G0000, so UP_PATH stays enriched.
+    assert up["padj"] < 0.05
+    assert "SYM-G0000" in up["genes"]
+
+
 def test_gsea_matches_the_legacy_server_module(tmp_path):
     """Same rank, GMT, seed and frozen parameters through both call sites."""
     ar = pytest.importorskip("biominer_server.core.analysis_runner")
