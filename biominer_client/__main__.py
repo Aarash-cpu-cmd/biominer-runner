@@ -41,7 +41,8 @@ def _write_token(path: str, token: str) -> None:
 
 
 def _client(args) -> BioMinerClient:
-    return BioMinerClient(base_url=args.base_url, token=_read_token(args))
+    return BioMinerClient(base_url=args.base_url, token=_read_token(args),
+                          receipt_cache=args.token_file + ".receipts.json")
 
 
 def _emit(obj) -> None:
@@ -56,18 +57,27 @@ def main(argv: list[str] | None = None) -> int:
                              "or the public endpoint)")
     parser.add_argument("--token-file", default=".biominer_token",
                         help="file holding the bearer token")
+    # Accept --base-url / --token-file both before AND after the subcommand
+    # (users naturally write `login --username x --token-file f`). SUPPRESS
+    # keeps an explicit global value from being clobbered by the subparser.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--base-url", default=argparse.SUPPRESS)
+    common.add_argument("--token-file", default=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     for name in ("register", "login"):
-        p = sub.add_parser(name, help=f"{name} a BioMiner account")
+        p = sub.add_parser(name, help=f"{name} a BioMiner account",
+                           parents=[common])
         p.add_argument("--username", required=True)
         p.add_argument("--password", required=True)
 
-    p = sub.add_parser("export", help="download a series' counts + sample sheet")
+    p = sub.add_parser("export", help="download a series' counts + sample sheet",
+                       parents=[common])
     p.add_argument("--gse", required=True)
     p.add_argument("--out", required=True, type=Path)
 
-    p = sub.add_parser("run", help="full download -> local DE/enrichment -> save")
+    p = sub.add_parser("run", help="full download -> local DE/enrichment -> save",
+                       parents=[common])
     p.add_argument("--gse", required=True)
     p.add_argument("--numerator", required=True)
     p.add_argument("--denominator", required=True)
@@ -83,7 +93,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-register", action="store_true",
                    help="analyse locally but do not save back to BioMiner")
 
-    p = sub.add_parser("save", help="upload + register an existing local result")
+    p = sub.add_parser("save", help="upload + register an existing local result",
+                       parents=[common])
     p.add_argument("--study-id", required=True)
     p.add_argument("--provenance", required=True, type=Path)
     p.add_argument("--de-table", required=True, type=Path)

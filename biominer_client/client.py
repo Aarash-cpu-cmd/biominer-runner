@@ -14,6 +14,7 @@ defaults to the public BioMiner endpoint and can be overridden with
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,30 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+_SECRET_KEYS = ("token", "password", "api_key", "access_token", "secret")
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip credential values from a response body before it reaches an
+    error message or log. A misclassified success body can carry a bearer
+    token; never echo it. Falls back to a regex mask for non-JSON text."""
+    import json
+    import re
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            for k in list(obj):
+                if k.lower() in _SECRET_KEYS:
+                    obj[k] = "***"
+            return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        pass
+    return re.sub(
+        r'((?:token|password|api_key|access_token|secret)["\']?\s*[:=]\s*["\']?)'
+        r'[^\s"\',}]+',
+        r'\1***', text, flags=re.IGNORECASE)
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -77,12 +102,20 @@ class BioMinerClient:
     transport:
         Optional httpx transport override (used by tests to pin DNS or to
         inject a mock transport). Production callers leave this ``None``.
+    receipt_cache:
+        Optional path to a persistent content-addressed receipt cache. The
+        server mints a fresh ``receipt_id`` for every upload even when the
+        bytes are identical, which would break idempotent re-registration
+        (the register body would change). When a cache path is given, an
+        upload whose ``(filename, sha256)`` was already uploaded reuses the
+        stored receipt instead of re-uploading, so a retry replays cleanly.
     """
 
     def __init__(self, base_url: str | None = None, token: str | None = None,
                  *, verify: str | bool = _DEFAULT_VERIFY,
                  trust_env: bool = False, timeout: float = 120.0,
-                 transport: httpx.BaseTransport | None = None):
+                 transport: httpx.BaseTransport | None = None,
+                 receipt_cache: str | Path | None = None):
         self.base_url = (base_url or os.environ.get("BIOMINER_BASE_URL")
                          or DEFAULT_BASE_URL).rstrip("/")
         self.token = token or os.environ.get("BIOMINER_TOKEN")
@@ -93,6 +126,14 @@ class BioMinerClient:
             base_url=self.base_url, verify=verify, trust_env=trust_env,
             timeout=timeout, headers=headers, transport=transport,
             follow_redirects=True)
+        self._receipt_cache_path = Path(receipt_cache) if receipt_cache else None
+        self._receipts: dict[str, Any] = {}
+        if self._receipt_cache_path and self._receipt_cache_path.is_file():
+            try:
+                self._receipts = json.loads(
+                    self._receipt_cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                self._receipts = {}
 
     # -- lifecycle -----------------------------------------------------
     def __enter__(self) -> "BioMinerClient":
@@ -122,8 +163,9 @@ class BioMinerClient:
         return self._consume_auth(r)
 
     def _consume_auth(self, r: httpx.Response) -> str:
-        if r.status_code != 200:
-            raise BioMinerError("AUTH_FAILED", r.text[:300],
+        # Register returns 201 Created, login 200 OK; accept any 2xx.
+        if not (200 <= r.status_code < 300):
+            raise BioMinerError("AUTH_FAILED", _redact_secrets(r.text)[:300],
                                 http_status=r.status_code)
         token = (r.json() or {}).get("token")
         if not token:
@@ -148,7 +190,7 @@ class BioMinerClient:
             envelope = r.json()
         except Exception as exc:  # non-JSON (e.g. HTML error page)
             raise BioMinerError("BAD_RESPONSE",
-                                f"HTTP {r.status_code}: {r.text[:200]}",
+                                f"HTTP {r.status_code}: {_redact_secrets(r.text)[:200]}",
                                 http_status=r.status_code) from exc
         if not envelope.get("ok", False):
             err = envelope.get("error") or {}
@@ -189,19 +231,42 @@ class BioMinerClient:
         """Mint a ticket, POST the bytes, and return the server receipt.
 
         The receipt proves only that the server received exactly these
-        bytes; it carries no scientific authority.
+        bytes; it carries no scientific authority. With a receipt cache
+        configured, identical ``(filename, sha256)`` reuses the stored
+        receipt so idempotent re-registration sees an unchanged body.
         """
+        sha = _sha256_bytes(data)
+        cache_key = f"{filename}:{sha}"
+        if self._receipt_cache_path is not None and cache_key in self._receipts:
+            return self._receipts[cache_key]
         ticket = self.call_tool("upload_prepare", {
             "filename": filename, "size_bytes": len(data),
-            "sha256": _sha256_bytes(data)})["ticket"]
+            "sha256": sha})["ticket"]
         url = ticket.get("upload_url") or ticket["upload_path"]
         r = self._client.post(url, content=data,
                               headers={"Content-Type": "application/octet-stream"})
         if r.status_code != 200:
             raise BioMinerError("UPLOAD_FAILED",
-                                f"HTTP {r.status_code}: {r.text[:200]}",
+                                f"HTTP {r.status_code}: {_redact_secrets(r.text)[:200]}",
                                 http_status=r.status_code)
-        return r.json()["data"]["receipt"]
+        receipt = r.json()["data"]["receipt"]
+        if self._receipt_cache_path is not None:
+            self._receipts[cache_key] = receipt
+            self._persist_receipts()
+        return receipt
+
+    def _persist_receipts(self) -> None:
+        # Best-effort: a cache write failure must never fail an upload.
+        try:
+            self._receipt_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._receipt_cache_path.write_text(
+                json.dumps(self._receipts), encoding="utf-8")
+            try:
+                os.chmod(self._receipt_cache_path, 0o600)
+            except OSError:  # pragma: no cover - platform dependent
+                pass
+        except OSError:  # pragma: no cover - cache is optional
+            pass
 
     def upload_file(self, path: Path) -> dict:
         """Upload a local file by name and return its receipt."""

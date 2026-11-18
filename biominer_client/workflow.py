@@ -16,8 +16,8 @@ the statistics on the user's machine.
 """
 from __future__ import annotations
 
+import hashlib
 import json
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,26 @@ import pandas as pd
 from .client import BioMinerClient
 
 _SYMBOL_COLUMNS = ("gene_symbol", "gene_name", "symbol")
+
+
+def _stable_key(prefix: str, *parts: Any) -> str:
+    """Deterministic idempotency key derived from content.
+
+    Re-running the same analysis (same study intent, same result bytes)
+    replays the existing study/result instead of creating a duplicate. A
+    random UUID per call would silently accumulate duplicates on retry.
+    """
+    digest = hashlib.sha256(
+        "\x1f".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+    return f"{prefix}-{digest[:32]}"
+
+
+def _file_sha(path: Any) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def _parse_characteristics(text: str) -> dict[str, str]:
@@ -195,6 +215,11 @@ def save_result(client: BioMinerClient, study_id: str,
     """
     prov_receipt = client.upload_file(Path(de["provenance_path"]))
     de_receipt = client.upload_file(Path(de["de_table_path"]))
+    if idempotency_key is None:
+        idempotency_key = _stable_key(
+            "lr", study_id, contrast["numerator"], contrast["denominator"],
+            result_kind, _file_sha(de["provenance_path"]),
+            _file_sha(de["de_table_path"]))
     data = client.call_tool("local_result_register", {
         "study_id": study_id,
         "contrast": {"numerator": contrast["numerator"],
@@ -202,7 +227,7 @@ def save_result(client: BioMinerClient, study_id: str,
         "provenance_receipt_id": prov_receipt["receipt_id"],
         "de_table_receipt_id": de_receipt["receipt_id"],
         "result_kind": result_kind,
-        "idempotency_key": idempotency_key or f"lr-{uuid.uuid4().hex}"})
+        "idempotency_key": idempotency_key})
     return {"register": data,
             "provenance_receipt_id": prov_receipt["receipt_id"],
             "de_table_receipt_id": de_receipt["receipt_id"]}
@@ -243,7 +268,9 @@ def local_analysis(client: BioMinerClient, gse_id: str, numerator: str,
             study_id = client.call_tool("study_create", {
                 "body": {"organism": organism, "assay_type": assay_type,
                          "title": f"{gse_id}: {numerator} vs {denominator}"},
-                "idempotency_key": f"study-{uuid.uuid4().hex}"})["study_id"]
+                "idempotency_key": _stable_key(
+                    "study", gse_id, numerator, denominator, condition_key,
+                    organism, assay_type)})["study_id"]
         saved = save_result(client, study_id, de, contrast)
 
     return {"gse_id": gse_id, "workdir": workdir, "export": exported["export"],

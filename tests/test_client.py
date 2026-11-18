@@ -215,3 +215,136 @@ def test_save_result_uploads_and_registers(tmp_path):
     assert reg["study_id"] == "study_1"
     assert reg["idempotency_key"] == "fixed"
     assert reg["de_table_receipt_id"] and reg["provenance_receipt_id"]
+
+
+# -- auth: cold-start regressions -------------------------------------
+def test_register_accepts_201_created():
+    # The production /api/auth/register returns 201 Created (not 200) with a
+    # bearer token. A client that demands exactly 200 breaks cold-start signup.
+    def handler(request):
+        assert request.url.path.endswith("/api/auth/register")
+        return httpx.Response(201, json={"token": "tok_201", "username": "u",
+                                         "expires_at": 123.0})
+
+    with _client(handler) as c:
+        assert c.register("u", "p") == "tok_201"
+        assert c.token == "tok_201"
+
+
+def test_login_accepts_200():
+    def handler(request):
+        return httpx.Response(200, json={"token": "tok_200"})
+
+    with _client(handler) as c:
+        assert c.login("u", "p") == "tok_200"
+
+
+def test_auth_failure_redacts_token():
+    # A misclassified body carrying a token must never echo the secret.
+    def handler(request):
+        return httpx.Response(403, json={"token": "SUPERSECRET", "detail": "no"})
+
+    with _client(handler) as c:
+        with pytest.raises(BioMinerError) as exc:
+            c.register("u", "p")
+        assert exc.value.code == "AUTH_FAILED"
+        assert "SUPERSECRET" not in str(exc.value)
+        assert "***" in exc.value.message
+
+
+def test_redact_secrets_masks_credentials():
+    from biominer_client.client import _redact_secrets
+    out = _redact_secrets('{"token": "abc123", "password": "pw", "user": "bob"}')
+    assert "abc123" not in out and "pw" not in out and "bob" in out
+    # non-JSON falls back to a regex mask
+    out2 = _redact_secrets('token="leakme" trailing')
+    assert "leakme" not in out2
+
+
+# -- idempotency: cold-start regression -------------------------------
+def _save_handler(keys):
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/upload_prepare"):
+            return httpx.Response(200, json=_envelope({"ticket": {
+                "ticket_id": "upt", "upload_url": "https://example.test/ul/u"}}))
+        if path.endswith("/ul/u"):
+            return httpx.Response(200, json={"data": {"receipt": {
+                "receipt_id": "urc"}}})
+        if path.endswith("/local_result_register"):
+            keys.append(json.loads(request.content)["idempotency_key"])
+            return httpx.Response(200, json=_envelope({"result": {
+                "result_id": "lres_1"}}))
+        raise AssertionError(f"unexpected {path}")
+    return handler
+
+
+def test_save_result_idempotency_key_is_content_stable(tmp_path):
+    prov = tmp_path / "provenance.json"
+    prov.write_text(json.dumps({"schema": "bm_local_result_v1"}))
+    de = tmp_path / "de_table.tsv"
+    de.write_text("gene\tpadj\nENSG1\t0.01\n")
+    contrast = {"numerator": "Dexamethasone", "denominator": "Untreated"}
+    keys = []
+    with _client(_save_handler(keys)) as c:
+        workflow.save_result(c, "study_1",
+                             {"provenance_path": prov, "de_table_path": de},
+                             contrast)
+        workflow.save_result(c, "study_1",
+                             {"provenance_path": prov, "de_table_path": de},
+                             contrast)
+        # identical content -> identical key (server replays, no duplicate)
+        assert keys[0] == keys[1]
+        de.write_text("gene\tpadj\nENSG1\t0.02\n")  # changed result bytes
+        workflow.save_result(c, "study_1",
+                             {"provenance_path": prov, "de_table_path": de},
+                             contrast)
+        assert keys[2] != keys[0]
+
+
+def test_save_result_explicit_idempotency_key_honored(tmp_path):
+    prov = tmp_path / "provenance.json"
+    prov.write_text("{}")
+    de = tmp_path / "de_table.tsv"
+    de.write_text("gene\tpadj\nENSG1\t0.01\n")
+    keys = []
+    with _client(_save_handler(keys)) as c:
+        workflow.save_result(c, "study_1",
+                             {"provenance_path": prov, "de_table_path": de},
+                             {"numerator": "A", "denominator": "B"},
+                             idempotency_key="my-fixed-key")
+    assert keys == ["my-fixed-key"]
+
+
+def test_upload_receipt_cache_reuses_identical_content(tmp_path):
+    # The server mints a new receipt_id per upload; a content-addressed cache
+    # must reuse the receipt for identical bytes so re-registration replays.
+    cache = tmp_path / "receipts.json"
+    posts = []
+
+    def handler(request):
+        if request.url.path.endswith("/upload_prepare"):
+            return httpx.Response(200, json=_envelope({"ticket": {
+                "ticket_id": "upt", "upload_url": "https://example.test/ul/u"}}))
+        if request.url.path.endswith("/ul/u"):
+            posts.append(1)
+            return httpx.Response(200, json={"data": {"receipt": {
+                "receipt_id": "urc_fixed", "sha256": "s"}}})
+        raise AssertionError(f"unexpected {request.url}")
+
+    def mk():
+        return BioMinerClient(base_url="https://example.test", token="t",
+                              transport=httpx.MockTransport(handler),
+                              receipt_cache=cache)
+
+    with mk() as c1:
+        r1 = c1.upload_bytes("de.tsv", b"hello")
+    # a fresh session loads the persisted cache and skips the upload
+    with mk() as c2:
+        r2 = c2.upload_bytes("de.tsv", b"hello")
+    assert r1["receipt_id"] == r2["receipt_id"] == "urc_fixed"
+    assert len(posts) == 1
+    # changed content triggers a new upload
+    with mk() as c3:
+        c3.upload_bytes("de.tsv", b"world")
+    assert len(posts) == 2
