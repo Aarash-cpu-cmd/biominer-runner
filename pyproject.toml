@@ -18,10 +18,13 @@ dependencies = [
     "scipy==1.17.1",
     "psutil==7.1.3",
     "gseapy==1.3.0",
+    "httpx>=0.27",
+    "certifi>=2024.2.2",
 ]
 
 [project.scripts]
 bm_runner = "bm_runner.__main__:main"
+biominer-client = "biominer_client.__main__:main"
 
 [tool.setuptools]
-packages = ["bm_runner"]
+packages = ["bm_runner", "biominer_client"]

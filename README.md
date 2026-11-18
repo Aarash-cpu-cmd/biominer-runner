@@ -74,6 +74,18 @@ runner 只接受冻结支持矩阵内的分析（V1：两组、非配对、无�
 - MCP 端点：`https://biominer.hxzhi.cc.cd/mcp/workspace/mcp`（凭据在服务端签发；下载/上传走一次性票据，不携带凭据）。
 - 服务端代码与公共签名库不在本仓库开源范围内。
 
+## 本地工作流客户端 `biominer_client`
+
+随仓库提供连接器 `biominer_client`（CLI：`biominer-client`），把本机计算接回托管服务：**下载数据 → 本机跑 DE/GSEA/ORA → 回传并登记结果**。服务端只存字节、颁发票据、登记回执，不重算统计。
+
+```bash
+biominer-client login --username alice --password '***'
+biominer-client run --gse GSE52778 --numerator Dexamethasone \
+    --denominator Untreated --out work/airway
+```
+
+不内置任何凭据（令牌来自 `BIOMINER_TOKEN` 或本地令牌文件）。完整流程、Python API、契约与真实示例见 [docs/LOCAL_WORKFLOW.md](docs/LOCAL_WORKFLOW.md)。
+
 ## 测试
 
 ```bash
