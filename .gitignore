@@ -6,3 +6,4 @@ build/
 dist/
 *.egg-info/
 out/
+.biominer_token.receipts.json

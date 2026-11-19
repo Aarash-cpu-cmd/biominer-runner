@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bm-runner"
-version = "2.1.0"
+version = "2.1.1"
 description = "Fixed-version local bulk RNA-seq DE, GSEA and ORA runner for BioMiner"
 readme = "README.md"
 requires-python = ">=3.11"
