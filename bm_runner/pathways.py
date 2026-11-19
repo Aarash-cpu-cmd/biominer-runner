@@ -36,6 +36,15 @@ LFC_THRESHOLD = 1.0
 FDR_STRICT = 0.05
 FDR_EXPLORATORY = 0.25
 SUPPORTED_SPECIES = ("human",)
+# Accept the canonical scientific name used across the rest of BioMiner
+# (study_create / dataset_search / signature_search all use "Homo sapiens")
+# as a synonym for the runner's colloquial "human". V1 stays human-only.
+_SPECIES_SYNONYMS = {
+    "human": "human",
+    "homo sapiens": "human",
+    "h. sapiens": "human",
+    "hsapiens": "human",
+}
 
 
 def _utcnow() -> str:
@@ -44,12 +53,13 @@ def _utcnow() -> str:
 
 def _check_species(species: str) -> str:
     value = str(species or "").strip().lower()
-    if value not in SUPPORTED_SPECIES:
+    canonical = _SPECIES_SYNONYMS.get(value)
+    if canonical is None:
         raise Refusal(
             "SPECIES_UNSUPPORTED",
             "V1 pathway analysis supports human only; mouse is a V2 feature",
             {"species": species, "supported": list(SUPPORTED_SPECIES)})
-    return value
+    return canonical
 
 
 def _read_gmt(path: Path, species: str) -> tuple[dict[str, list[str]], dict]:

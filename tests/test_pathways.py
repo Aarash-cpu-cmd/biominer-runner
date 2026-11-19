@@ -167,6 +167,22 @@ def test_mouse_is_refused_in_v1(tmp_path):
     assert exc.value.code == "SPECIES_UNSUPPORTED"
 
 
+def test_canonical_species_name_normalizes_to_human():
+    """The scientific name used across BioMiner must be accepted as human.
+
+    study_create / dataset_search / signature_search all use "Homo sapiens";
+    the pathway runner previously rejected it (only literal "human"), which
+    broke the local workflow when the agent passed the canonical organism.
+    """
+    for name in ("human", "Homo sapiens", "H. sapiens", "hsapiens",
+                 "  Homo Sapiens  "):
+        assert P._check_species(name) == "human"
+    for name in ("mouse", "Mus musculus", "rat", ""):
+        with pytest.raises(P.Refusal) as exc:
+            P._check_species(name)
+        assert exc.value.code == "SPECIES_UNSUPPORTED"
+
+
 def test_cli_gsea_and_ora_dispatch(tmp_path):
     """The packaged entry point must dispatch gsea/ora without run-only flags."""
     from bm_runner.__main__ import main
