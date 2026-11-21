@@ -267,18 +267,30 @@ class BioMinerClient:
                                 f"{dest.name}: sha256 {h.hexdigest()} != {expected}")
         return dest
 
-    def upload_bytes(self, filename: str, data: bytes) -> dict:
+    def upload_bytes(self, filename: str, data: bytes, *,
+                     semantic_sha: str | None = None) -> dict:
         """Mint a ticket, POST the bytes, and return the server receipt.
 
         The receipt proves only that the server received exactly these
         bytes; it carries no scientific authority. With a receipt cache
         configured, identical ``(filename, sha256)`` reuses the stored
         receipt so idempotent re-registration sees an unchanged body.
+
+        ``semantic_sha`` adds a second cache index for content that is
+        semantically identical but byte-different (e.g. provenance with a
+        fresh ``created_at``/``metrics``): a re-run reuses the ORIGINAL
+        receipt, keeping the register body — and thus the server-side
+        idempotency binding — unchanged (bug #12).
         """
         sha = _sha256_bytes(data)
         cache_key = f"{filename}:{sha}"
-        if self._receipt_cache_path is not None and cache_key in self._receipts:
-            return self._receipts[cache_key]
+        semantic_key = (f"{filename}:semantic:{semantic_sha}"
+                        if semantic_sha else None)
+        if self._receipt_cache_path is not None:
+            if cache_key in self._receipts:
+                return self._receipts[cache_key]
+            if semantic_key and semantic_key in self._receipts:
+                return self._receipts[semantic_key]
         ticket = self.call_tool("upload_prepare", {
             "filename": filename, "size_bytes": len(data),
             "sha256": sha})["ticket"]
@@ -292,8 +304,42 @@ class BioMinerClient:
         receipt = r.json()["data"]["receipt"]
         if self._receipt_cache_path is not None:
             self._receipts[cache_key] = receipt
+            if semantic_key:
+                self._receipts[semantic_key] = receipt
             self._persist_receipts()
         return receipt
+
+    def cached_receipts(self, filename: str) -> list[dict]:
+        """Distinct cached receipts for ``filename``, newest first.
+
+        Used to recover from a register CONFLICT: the idempotency key is
+        already bound to an earlier request body, so the client retries
+        with the receipts it originally uploaded (bug #12 migration).
+        """
+        seen: set[str] = set()
+        out: list[dict] = []
+        for key in reversed(list(self._receipts)):
+            if not key.startswith(f"{filename}:"):
+                continue
+            receipt = self._receipts[key]
+            rid = receipt.get("receipt_id")
+            if rid and rid not in seen:
+                seen.add(rid)
+                out.append(receipt)
+        return out
+
+    def rebind_semantic_receipt(self, filename: str, semantic_sha: str,
+                                receipt: dict) -> None:
+        """Point the semantic cache index at the originally-bound receipt.
+
+        After a CONFLICT recovery the semantic index may point at a newer
+        upload that the server rejected; rebinding makes the next re-run
+        replay directly without another CONFLICT round-trip (bug #12).
+        """
+        if self._receipt_cache_path is None:
+            return
+        self._receipts[f"{filename}:semantic:{semantic_sha}"] = receipt
+        self._persist_receipts()
 
     def _persist_receipts(self) -> None:
         # Best-effort: a cache write failure must never fail an upload.
@@ -308,10 +354,12 @@ class BioMinerClient:
         except OSError:  # pragma: no cover - cache is optional
             pass
 
-    def upload_file(self, path: Path) -> dict:
+    def upload_file(self, path: Path, *,
+                    semantic_sha: str | None = None) -> dict:
         """Upload a local file by name and return its receipt."""
         path = Path(path)
-        return self.upload_bytes(path.name, path.read_bytes())
+        return self.upload_bytes(path.name, path.read_bytes(),
+                                 semantic_sha=semantic_sha)
 
     # -- convenience ---------------------------------------------------
     def workspace_info(self) -> dict:

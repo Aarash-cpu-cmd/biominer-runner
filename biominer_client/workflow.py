@@ -23,7 +23,7 @@ from typing import Any
 
 import pandas as pd
 
-from .client import BioMinerClient
+from .client import BioMinerClient, BioMinerError
 
 _SYMBOL_COLUMNS = ("gene_symbol", "gene_name", "symbol")
 
@@ -46,6 +46,29 @@ def _file_sha(path: Any) -> str:
         for block in iter(lambda: fh.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+# Provenance fields that legitimately vary between two runs of the SAME
+# analysis (wall clock, timing/RSS sampling). They must not take part in
+# the idempotency key, otherwise every re-run registers a duplicate result
+# instead of replaying (bug #12: re-run produced replayed=false even though
+# the de_table was byte-identical).
+_PROVENANCE_VOLATILE_KEYS = ("created_at", "metrics")
+
+
+def _provenance_semantic_sha(path: Any) -> str:
+    """SHA-256 of the provenance with volatile fields removed.
+
+    Everything else (params, engine, input/output digests, dependencies,
+    design) is deterministic for identical inputs, so two runs of the same
+    contrast hash equal and the server replays the stored result.
+    """
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    for key in _PROVENANCE_VOLATILE_KEYS:
+        doc.pop(key, None)
+    canonical = json.dumps(doc, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _parse_characteristics(text: str) -> dict[str, str]:
@@ -243,21 +266,52 @@ def save_result(client: BioMinerClient, study_id: str,
     The server validates the provenance schema and stores the bytes; it
     does not recompute or endorse the statistics.
     """
-    prov_receipt = client.upload_file(Path(de["provenance_path"]))
+    prov_semantic = _provenance_semantic_sha(de["provenance_path"])
+    prov_receipt = client.upload_file(Path(de["provenance_path"]),
+                                      semantic_sha=prov_semantic)
     de_receipt = client.upload_file(Path(de["de_table_path"]))
     if idempotency_key is None:
+        # Semantic provenance hash (volatile created_at/metrics excluded) +
+        # de_table bytes: stable across re-runs of the same contrast, so the
+        # server replays instead of accumulating duplicates (bug #12).
         idempotency_key = _stable_key(
             "lr", study_id, contrast["numerator"], contrast["denominator"],
-            result_kind, _file_sha(de["provenance_path"]),
-            _file_sha(de["de_table_path"]))
-    data = client.call_tool("local_result_register", {
-        "study_id": study_id,
-        "contrast": {"numerator": contrast["numerator"],
-                     "denominator": contrast["denominator"]},
-        "provenance_receipt_id": prov_receipt["receipt_id"],
-        "de_table_receipt_id": de_receipt["receipt_id"],
-        "result_kind": result_kind,
-        "idempotency_key": idempotency_key})
+            result_kind, prov_semantic, _file_sha(de["de_table_path"]))
+
+    def _register(prov: dict, de_r: dict) -> dict:
+        return client.call_tool("local_result_register", {
+            "study_id": study_id,
+            "contrast": {"numerator": contrast["numerator"],
+                         "denominator": contrast["denominator"]},
+            "provenance_receipt_id": prov["receipt_id"],
+            "de_table_receipt_id": de_r["receipt_id"],
+            "result_kind": result_kind,
+            "idempotency_key": idempotency_key})
+
+    try:
+        data = _register(prov_receipt, de_receipt)
+    except BioMinerError as exc:
+        if exc.code != "CONFLICT":
+            raise
+        # The key is already bound to an earlier request body (e.g. a
+        # pre-fix run uploaded byte-different provenance). Replay that
+        # original registration by retrying with previously cached
+        # receipts instead of failing the re-run (bug #12 migration).
+        data = None
+        for old_prov in client.cached_receipts(Path(de["provenance_path"]).name):
+            if old_prov["receipt_id"] == prov_receipt["receipt_id"]:
+                continue
+            try:
+                data = _register(old_prov, de_receipt)
+                prov_receipt = old_prov
+                client.rebind_semantic_receipt(
+                    Path(de["provenance_path"]).name, prov_semantic, old_prov)
+                break
+            except BioMinerError as retry_exc:
+                if retry_exc.code != "CONFLICT":
+                    raise
+        if data is None:
+            raise
     return {"register": data,
             "provenance_receipt_id": prov_receipt["receipt_id"],
             "de_table_receipt_id": de_receipt["receipt_id"]}

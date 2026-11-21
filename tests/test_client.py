@@ -302,6 +302,42 @@ def test_save_result_idempotency_key_is_content_stable(tmp_path):
         assert keys[2] != keys[0]
 
 
+def test_save_result_key_ignores_volatile_provenance_fields(tmp_path):
+    # Bug #12 regression: a full re-run of the same contrast produces a
+    # byte-identical de_table but provenance with fresh created_at/metrics
+    # (wall clock, elapsed_s, RSS). The idempotency key must ignore those
+    # volatile fields so the server replays instead of registering a
+    # duplicate result.
+    base = {"schema": "bm_local_result_v1",
+            "params": {"alpha": 0.05},
+            "output": {"de_table_sha256": "abc"},
+            "created_at": "2026-11-21T07:50:28Z",
+            "metrics": {"elapsed_s": 71.35, "peak_rss_mb": 240.3}}
+    prov = tmp_path / "provenance.json"
+    de = tmp_path / "de_table.tsv"
+    de.write_text("gene\tpadj\nENSG1\t0.01\n")
+    contrast = {"numerator": "Dexamethasone", "denominator": "Untreated"}
+    keys = []
+    with _client(_save_handler(keys)) as c:
+        prov.write_text(json.dumps(base))
+        workflow.save_result(c, "study_1",
+                             {"provenance_path": prov, "de_table_path": de},
+                             contrast)
+        rerun = dict(base, created_at="2026-11-21T08:10:00Z",
+                     metrics={"elapsed_s": 69.9, "peak_rss_mb": 251.0})
+        prov.write_text(json.dumps(rerun))
+        workflow.save_result(c, "study_1",
+                             {"provenance_path": prov, "de_table_path": de},
+                             contrast)
+        assert keys[0] == keys[1]  # volatile-only diff -> replay
+        changed = dict(base, params={"alpha": 0.01})
+        prov.write_text(json.dumps(changed))
+        workflow.save_result(c, "study_1",
+                             {"provenance_path": prov, "de_table_path": de},
+                             contrast)
+        assert keys[2] != keys[0]  # semantic diff -> new result
+
+
 def test_save_result_explicit_idempotency_key_honored(tmp_path):
     prov = tmp_path / "provenance.json"
     prov.write_text("{}")
@@ -348,6 +384,118 @@ def test_upload_receipt_cache_reuses_identical_content(tmp_path):
     with mk() as c3:
         c3.upload_bytes("de.tsv", b"world")
     assert len(posts) == 2
+
+
+# -- bug #12: semantic receipt reuse + CONFLICT self-heal --------------
+def test_upload_semantic_sha_reuses_receipt_across_byte_diffs(tmp_path):
+    cache = tmp_path / "receipts.json"
+    posts = []
+
+    def handler(request):
+        if request.url.path.endswith("/upload_prepare"):
+            return httpx.Response(200, json=_envelope({"ticket": {
+                "ticket_id": "upt", "upload_url": "https://example.test/ul/u"}}))
+        if request.url.path.endswith("/ul/u"):
+            posts.append(1)
+            return httpx.Response(200, json={"data": {"receipt": {
+                "receipt_id": f"urc_{len(posts)}"}}})
+        raise AssertionError(f"unexpected {request.url}")
+
+    def mk():
+        return BioMinerClient(base_url="https://example.test", token="t",
+                              transport=httpx.MockTransport(handler),
+                              receipt_cache=cache)
+
+    with mk() as c1:
+        r1 = c1.upload_bytes("provenance.json", b'{"created_at": "t1"}',
+                             semantic_sha="sem")
+    # byte-different but semantically identical -> reuse ORIGINAL receipt
+    with mk() as c2:
+        r2 = c2.upload_bytes("provenance.json", b'{"created_at": "t2"}',
+                             semantic_sha="sem")
+    assert r1["receipt_id"] == r2["receipt_id"] == "urc_1"
+    assert len(posts) == 1
+    # different semantics -> new upload
+    with mk() as c3:
+        r3 = c3.upload_bytes("provenance.json", b'{"alpha": 0.01}',
+                             semantic_sha="other")
+    assert r3["receipt_id"] == "urc_2"
+    assert len(posts) == 2
+
+
+def test_save_result_conflict_recovers_with_original_receipts(tmp_path):
+    # Migration path: a pre-fix run bound the idempotency key to a body
+    # carrying receipt R1. A fixed re-run uploads byte-different provenance
+    # (R2) -> server CONFLICT -> client must retry with the cached R1 and
+    # replay instead of failing.
+    cache = tmp_path / "receipts.json"
+    uploads = []
+    bindings = {}
+    registers = []
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/upload_prepare"):
+            return httpx.Response(200, json=_envelope({"ticket": {
+                "ticket_id": "upt", "upload_url": "https://example.test/ul/u"}}))
+        if path.endswith("/ul/u"):
+            uploads.append(1)
+            return httpx.Response(200, json={"data": {"receipt": {
+                "receipt_id": f"urc_{len(uploads)}"}}})
+        if path.endswith("/local_result_register"):
+            body = json.loads(request.content)
+            registers.append(body)
+            key = body["idempotency_key"]
+            sig = (body["provenance_receipt_id"], body["de_table_receipt_id"])
+            if key not in bindings:
+                bindings[key] = sig
+                return httpx.Response(200, json=_envelope({"result": {
+                    "result_id": "lres_1"}, "replayed": False}))
+            if bindings[key] == sig:
+                return httpx.Response(200, json=_envelope({"result": {
+                    "result_id": "lres_1"}, "replayed": True}))
+            return httpx.Response(200, json=_envelope(
+                ok=False, error={"code": "CONFLICT",
+                                 "message": "idempotency key is already "
+                                            "bound to a different request"}))
+        raise AssertionError(f"unexpected {path}")
+
+    def mk():
+        return BioMinerClient(base_url="https://example.test", token="t",
+                              transport=httpx.MockTransport(handler),
+                              receipt_cache=cache)
+
+    prov = tmp_path / "provenance.json"
+    de = tmp_path / "de_table.tsv"
+    de.write_text("gene\tpadj\nENSG1\t0.01\n")
+    contrast = {"numerator": "A", "denominator": "B"}
+    base = {"schema": "bm_local_result_v1", "params": {"alpha": 0.05}}
+    # legacy run: no semantic index, binds key -> (urc_1, urc_2)
+    prov.write_text(json.dumps(dict(base, created_at="t1")))
+    with mk() as c:
+        workflow.save_result(c, "study_1",
+                             {"provenance_path": prov, "de_table_path": de},
+                             contrast)
+    # fixed re-run: volatile-only provenance diff, semantic cache miss on
+    # the legacy entry -> uploads urc_3 -> CONFLICT -> recovers with urc_1
+    prov.write_text(json.dumps(dict(base, created_at="t2")))
+    with mk() as c:
+        saved = workflow.save_result(
+            c, "study_1",
+            {"provenance_path": prov, "de_table_path": de}, contrast)
+    assert saved["register"]["replayed"] is True
+    assert saved["provenance_receipt_id"] == "urc_1"
+    assert registers[-1]["provenance_receipt_id"] == "urc_1"
+    # and the semantic index now points at the original receipt: a third
+    # run replays directly without any CONFLICT round-trip
+    n_registers = len(registers)
+    prov.write_text(json.dumps(dict(base, created_at="t3")))
+    with mk() as c:
+        saved3 = workflow.save_result(
+            c, "study_1",
+            {"provenance_path": prov, "de_table_path": de}, contrast)
+    assert saved3["register"]["replayed"] is True
+    assert len(registers) == n_registers + 1  # no retry needed
 
 
 # -- anonymous credential ----------------------------------------------
