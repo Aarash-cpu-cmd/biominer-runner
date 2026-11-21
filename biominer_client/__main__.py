@@ -2,16 +2,24 @@
 
 Examples
 --------
+    # Zero-account: an ephemeral anonymous credential is minted automatically.
+    biominer-client conditions --gse GSE52778
+    biominer-client run --gse GSE52778 --condition-key treatment \
+        --numerator Dexamethasone --denominator Untreated --out work/airway
+
+    # Or use a registered account (token persisted to --token-file).
     biominer-client login --username alice --token-file .biominer_token
     biominer-client export --gse GSE52778 --out work/export
-    biominer-client run --gse GSE52778 --numerator Dexamethasone \
-        --denominator Untreated --out work/airway
     biominer-client save --study-id study_x --provenance work/airway/de/provenance.json \
         --de-table work/airway/de/de_table.tsv --numerator Dexamethasone --denominator Untreated
 
 The token is read from ``--token-file`` or ``BIOMINER_TOKEN``; it is never
 printed. ``register`` / ``login`` write it to ``--token-file`` (default
 ``.biominer_token``) with owner-only permissions where the platform supports it.
+When no token is available, ``export`` / ``conditions`` / ``run`` / ``save``
+mint a short-lived anonymous credential (registered-user parity except cloud
+compute); it is not persisted, and the server's find-or-mint semantics keep
+repeated runs in one study namespace via a stable device fingerprint.
 """
 from __future__ import annotations
 
@@ -40,9 +48,17 @@ def _write_token(path: str, token: str) -> None:
         pass
 
 
-def _client(args) -> BioMinerClient:
-    return BioMinerClient(base_url=args.base_url, token=_read_token(args),
-                          receipt_cache=args.token_file + ".receipts.json")
+def _client(args, *, auth: bool = True) -> BioMinerClient:
+    c = BioMinerClient(base_url=args.base_url, token=_read_token(args),
+                       receipt_cache=args.token_file + ".receipts.json")
+    if auth and not c.token:
+        # Keyless one-click path: mint an ephemeral anonymous credential.
+        # Not written to --token-file (it self-destructs on expiry/budget);
+        # the server reuses the session by device fingerprint on later runs.
+        c.mint_anonymous()
+        print("[biominer-client] no token found; minted an ephemeral "
+              "anonymous credential (no account needed)", file=sys.stderr)
+    return c
 
 
 def _emit(obj) -> None:
@@ -76,6 +92,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--gse", required=True)
     p.add_argument("--out", required=True, type=Path)
 
+    p = sub.add_parser("conditions",
+                       help="list a series' condition fields + value counts "
+                            "(pick --condition-key/--numerator/--denominator "
+                            "from real labels before running)",
+                       parents=[common])
+    p.add_argument("--gse", required=True)
+    p.add_argument("--out", default=None, type=Path,
+                   help="export directory (default: a per-series temp dir)")
+
     p = sub.add_parser("run", help="full download -> local DE/enrichment -> save",
                        parents=[common])
     p.add_argument("--gse", required=True)
@@ -83,13 +108,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--denominator", required=True)
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--condition-key", default="treatment",
-                   help="characteristics field used to label groups")
+                   help="characteristics field used to label groups "
+                        "(see the 'conditions' subcommand)")
+    p.add_argument("--condition-map", default=None, type=Path,
+                   help="JSON file mapping sample_id -> group label; "
+                        "overrides sheet/characteristics labelling")
     p.add_argument("--libraries", default="go_bp",
                    help="comma-separated gene-set libraries (go_bp,reactome,wikipathways)")
     p.add_argument("--enrichment", default="gsea,ora",
                    help="comma-separated enrichment kinds, or 'none'")
     p.add_argument("--study-id", default=None)
     p.add_argument("--organism", default="Homo sapiens")
+    p.add_argument("--species", default=None,
+                   help="enrichment species override (default: the export "
+                        "manifest's organism; unsupported species are "
+                        "honestly refused by the runner)")
     p.add_argument("--no-register", action="store_true",
                    help="analyse locally but do not save back to BioMiner")
 
@@ -105,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.cmd in ("register", "login"):
-            with _client(args) as c:
+            with _client(args, auth=False) as c:
                 fn = c.register if args.cmd == "register" else c.login
                 token = fn(args.username, args.password)
             _write_token(args.token_file, token)
@@ -122,16 +155,44 @@ def main(argv: list[str] | None = None) -> int:
                    "sheet_path": str(result["sheet_path"])})
             return 0
 
+        if args.cmd == "conditions":
+            out = args.out
+            if out is None:
+                import tempfile
+                out = Path(tempfile.gettempdir()) / f"biominer-export-{args.gse}"
+            with _client(args) as c:
+                exported = workflow.export_dataset(c, args.gse, out)
+                summary = workflow.summarize_conditions(exported)
+            _emit({"ok": True, "gse_id": args.gse,
+                   "organism": exported["export"].get("organism"),
+                   **summary,
+                   "sheet_path": str(exported["sheet_path"]),
+                   "hint": "pick --condition-key and two labels with >=2 "
+                           "samples each, then pass them to 'run'"})
+            return 0
+
         if args.cmd == "run":
             libraries = tuple(x for x in args.libraries.split(",") if x)
             enrichment = (() if args.enrichment.lower() == "none"
                           else tuple(x for x in args.enrichment.split(",") if x))
+            condition_map = None
+            if args.condition_map:
+                condition_map = json.loads(
+                    args.condition_map.read_text(encoding="utf-8"))
+                if not isinstance(condition_map, dict) or not all(
+                        isinstance(k, str) and isinstance(v, str)
+                        for k, v in condition_map.items()):
+                    raise ValueError("--condition-map must be a JSON object "
+                                     "of sample_id -> label strings")
             with _client(args) as c:
                 result = workflow.local_analysis(
                     c, args.gse, args.numerator, args.denominator, args.out,
-                    condition_key=args.condition_key, libraries=libraries,
+                    condition_key=args.condition_key,
+                    condition_map=condition_map, libraries=libraries,
                     enrichment=enrichment, study_id=args.study_id,
-                    organism=args.organism, register=not args.no_register)
+                    organism=args.organism, species=args.species,
+                    register=not args.no_register,
+                    progress=lambda msg: print(msg, file=sys.stderr, flush=True))
             cls = (result["de"]["provenance"].get("classification") or {})
             _emit({"ok": True, "gse_id": args.gse,
                    "contrast": f'{args.numerator} vs {args.denominator}',
@@ -159,7 +220,13 @@ def main(argv: list[str] | None = None) -> int:
                "details": exc.details})
         return 2
     except (ValueError, FileNotFoundError) as exc:
-        _emit({"ok": False, "code": "INVALID_INPUT", "message": str(exc)})
+        payload = {"ok": False, "code": "INVALID_INPUT", "message": str(exc)}
+        if args.cmd == "run" and "empty group" in str(exc):
+            payload["hint"] = (
+                f"run `biominer-client conditions --gse {args.gse}` to list "
+                "the real condition fields/labels, or supply "
+                "--condition-map sample_id->label JSON")
+        _emit(payload)
         return 2
     return 1
 

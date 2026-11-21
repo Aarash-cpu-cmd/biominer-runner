@@ -13,9 +13,11 @@ defaults to the public BioMiner endpoint and can be overridden with
 """
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import os
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +73,18 @@ def _redact_secrets(text: str) -> str:
         r'((?:token|password|api_key|access_token|secret)["\']?\s*[:=]\s*["\']?)'
         r'[^\s"\',}]+',
         r'\1***', text, flags=re.IGNORECASE)
+
+
+def _default_device_fp() -> str:
+    """Stable, non-secret device id for anonymous find-or-mint semantics.
+
+    The server binds an anonymous session's owner to this fingerprint, so a
+    stable per-machine value lets repeated CLI runs land in the same study
+    namespace. Derived from hostname+username (never sent in clear as such —
+    only a truncated sha256), matching the server's ``[A-Za-z0-9_-]{8,64}``.
+    """
+    seed = f"{socket.gethostname()}|{getpass.getuser()}"
+    return "cli-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
 def _sha256_file(path: Path) -> str:
@@ -172,6 +186,32 @@ class BioMinerClient:
             raise BioMinerError("AUTH_FAILED", "no token in auth response")
         self._set_token(token)
         return token
+
+    def mint_anonymous(self, device_fp: str | None = None) -> str:
+        """Auto-issue an ephemeral anonymous credential — no account needed.
+
+        Anonymous sessions have registered-user parity except cloud compute;
+        the credential self-destructs on expiry or budget exhaustion. The
+        device fingerprint keeps the study namespace stable across runs
+        (find-or-mint server-side), so repeated CLI calls reuse one session.
+        """
+        r = self._client.post(
+            "/api/mcp/auth/anonymous",
+            headers={"X-BM-Device-Fp": device_fp or _default_device_fp()})
+        if not (200 <= r.status_code < 300):
+            raise BioMinerError("AUTH_FAILED", _redact_secrets(r.text)[:300],
+                                http_status=r.status_code)
+        token = (r.json() or {}).get("credential")
+        if not isinstance(token, str) or not token:
+            raise BioMinerError("AUTH_FAILED",
+                                "anonymous auth returned no credential",
+                                http_status=r.status_code)
+        self._set_token(token)
+        return token
+
+    def ensure_token(self) -> str:
+        """Return the current token, minting an anonymous one if keyless."""
+        return self.token or self.mint_anonymous()
 
     # -- tool calls ----------------------------------------------------
     def call_tool(self, name: str, args: dict | None = None,

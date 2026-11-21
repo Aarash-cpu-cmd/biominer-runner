@@ -348,3 +348,121 @@ def test_upload_receipt_cache_reuses_identical_content(tmp_path):
     with mk() as c3:
         c3.upload_bytes("de.tsv", b"world")
     assert len(posts) == 2
+
+
+# -- anonymous credential ----------------------------------------------
+def test_mint_anonymous_sets_token_and_device_fp():
+    import re
+    seen = {}
+
+    def handler(request):
+        assert request.url.path == "/api/mcp/auth/anonymous"
+        seen["fp"] = request.headers.get("X-BM-Device-Fp")
+        return httpx.Response(200, json={"credential": "anon-abc123",
+                                         "expires_in": 3600})
+
+    with BioMinerClient(base_url="https://example.test", token=None,
+                        transport=httpx.MockTransport(handler)) as c:
+        assert c.token is None
+        tok = c.mint_anonymous()
+        assert tok == "anon-abc123"
+        assert c.token == tok
+        assert c._client.headers["Authorization"] == "Bearer anon-abc123"
+    assert re.fullmatch(r"[A-Za-z0-9_-]{8,64}", seen["fp"])
+
+
+def test_mint_anonymous_refusal_and_missing_credential():
+    def deny(request):
+        return httpx.Response(403, json={"error": "anonymous disabled"})
+
+    with BioMinerClient(base_url="https://example.test", token=None,
+                        transport=httpx.MockTransport(deny)) as c:
+        with pytest.raises(BioMinerError) as exc:
+            c.mint_anonymous()
+        assert exc.value.code == "AUTH_FAILED"
+
+    def empty(request):
+        return httpx.Response(200, json={"ok": True})
+
+    with BioMinerClient(base_url="https://example.test", token=None,
+                        transport=httpx.MockTransport(empty)) as c:
+        with pytest.raises(BioMinerError):
+            c.mint_anonymous()
+
+
+def test_ensure_token_reuses_existing_without_http():
+    def handler(request):
+        raise AssertionError("ensure_token must not call the network")
+
+    with _client(handler) as c:
+        assert c.ensure_token() == "t"
+
+
+def test_default_device_fp_stable_and_server_compatible():
+    import re
+    from biominer_client.client import _default_device_fp
+    fp = _default_device_fp()
+    assert fp == _default_device_fp()
+    assert re.fullmatch(r"[A-Za-z0-9_-]{8,64}", fp)
+
+
+# -- condition discovery ------------------------------------------------
+def test_summarize_conditions_counts_and_order(tmp_path):
+    sheet = tmp_path / "sample_sheet.tsv"
+    sheet.write_text(
+        "sample_id\tseries_id\ttitle\tcharacteristics\tcondition\n"
+        "S1\tGSE1\tt1\ttreatment: Dexamethasone,cell line: N1\t\n"
+        "S2\tGSE1\tt2\ttreatment: Dexamethasone,cell line: N2\t\n"
+        "S3\tGSE1\tt3\ttreatment: Untreated,cell line: N1\t\n"
+        "S4\tGSE1\tt4\ttreatment: Untreated,cell line: N2\t\n",
+        encoding="utf-8")
+    summary = workflow.summarize_conditions({"sheet_path": sheet})
+    assert summary["n_samples"] == 4
+    fields = summary["condition_fields"]
+    assert fields["treatment"] == {"Dexamethasone": 2, "Untreated": 2}
+    assert fields["cell line"] == {"N1": 2, "N2": 2}
+    assert "condition" not in fields  # empty column contributes nothing
+
+
+def test_summarize_conditions_includes_populated_condition_column(tmp_path):
+    sheet = tmp_path / "sample_sheet.tsv"
+    sheet.write_text(
+        "sample_id\tseries_id\ttitle\tcharacteristics\tcondition\n"
+        "S1\tGSE1\tt1\t\tctrl\n"
+        "S2\tGSE1\tt2\t\tcase\n"
+        "S3\tGSE1\tt3\t\tcase\n",
+        encoding="utf-8")
+    fields = workflow.summarize_conditions(
+        {"sheet_path": sheet})["condition_fields"]
+    assert fields["condition"] == {"case": 2, "ctrl": 1}
+
+
+# -- species follows the export manifest --------------------------------
+def test_local_analysis_species_follows_manifest(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(workflow, "export_dataset", lambda c, g, o: {
+        "export": {"organism": "Homo sapiens", "n_samples": 4},
+        "counts_path": tmp_path / "c.tsv", "sheet_path": tmp_path / "s.tsv"})
+    monkeypatch.setattr(workflow, "build_contrast",
+                        lambda *a, **k: {"n_samples": 4, "numerator": "x",
+                                         "denominator": "y"})
+    monkeypatch.setattr(workflow, "run_de",
+                        lambda *a, **k: {"de_table_path": tmp_path / "de.tsv"})
+    monkeypatch.setattr(workflow, "fetch_gene_sets",
+                        lambda *a, **k: {"go_bp": {}})
+
+    def fake_enrich(de, gs, out, *, kind, library, species):
+        captured[kind] = species
+        return {"kind": kind}
+
+    monkeypatch.setattr(workflow, "run_enrichment", fake_enrich)
+    msgs = []
+    workflow.local_analysis(None, "GSE1", "x", "y", tmp_path / "w",
+                            register=False, progress=msgs.append)
+    assert captured == {"gsea": "Homo sapiens", "ora": "Homo sapiens"}
+    assert any("[3/6]" in m for m in msgs)
+
+    captured.clear()
+    workflow.local_analysis(None, "GSE1", "x", "y", tmp_path / "w2",
+                            register=False, species="human")
+    assert captured == {"gsea": "human", "ora": "human"}

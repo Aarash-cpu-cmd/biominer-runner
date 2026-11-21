@@ -103,18 +103,21 @@ runner 只接受冻结支持矩阵内的分析（V1：两组、非配对、无�
 随仓库提供连接器 `biominer_client`（CLI：`biominer-client`），把本机计算接回托管服务：**下载数据 → 本机跑 DE/GSEA/ORA → 回传并登记结果**。服务端只存字节、颁发票据、登记回执，不重算统计。
 
 ```bash
-# 首次使用：注册账号（令牌写入 .biominer_token，绝不打印）
-biominer-client register --username alice --password '***'
-# 或登录已有账号
-biominer-client login --username alice --password '***'
+# 零账号一键跑：无令牌时自动铸造短命匿名凭据（无需注册，权限与注册用户一致，云计算除外）
+# 先看真实分组字段与取值样本数，再选对比
+biominer-client conditions --gse GSE52778
 # 下载 → 本机 DE/GSEA/ORA → 回传登记
 # 重复运行同一对比会幂等回放（replayed=true），不产生重复 study/结果
-biominer-client run --gse GSE52778 --numerator Dexamethasone \
-    --denominator Untreated --out work/airway \
+biominer-client run --gse GSE52778 --condition-key treatment \
+    --numerator Dexamethasone --denominator Untreated --out work/airway \
     --libraries go_bp,reactome,wikipathways
+
+# 或使用注册账号（令牌写入 .biominer_token，绝不打印）
+biominer-client register --username alice --password '***'
+biominer-client login --username alice --password '***'
 ```
 
-不内置任何凭据（令牌来自 `BIOMINER_TOKEN` 或本地令牌文件）。完整流程、Python API、契约与真实示例见 [docs/LOCAL_WORKFLOW.md](docs/LOCAL_WORKFLOW.md)。
+不内置任何凭据：令牌来自 `BIOMINER_TOKEN` / 本地令牌文件，缺省时自动匿名铸造（不落盘、到期自毁）。完整流程、Python API、契约与真实示例见 [docs/LOCAL_WORKFLOW.md](docs/LOCAL_WORKFLOW.md)。
 
 ## 测试
 

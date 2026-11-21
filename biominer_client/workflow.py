@@ -58,6 +58,36 @@ def _parse_characteristics(text: str) -> dict[str, str]:
     return out
 
 
+def summarize_conditions(export: dict[str, Any]) -> dict[str, Any]:
+    """Aggregate the export sheet's condition fields with sample counts.
+
+    Zero-knowledge contrast discovery: lists every ``characteristics`` key
+    (plus a populated ``condition`` column) and its value→count distribution,
+    so a caller can pick ``--condition-key`` / ``--numerator`` /
+    ``--denominator`` from real labels instead of guessing ``treatment``.
+    """
+    sheet = pd.read_csv(export["sheet_path"], sep="\t", dtype=str,
+                        keep_default_na=False)
+    fields: dict[str, dict[str, int]] = {}
+
+    def _bump(key: str, value: str) -> None:
+        value = value.strip()
+        if not value:
+            return
+        bucket = fields.setdefault(key, {})
+        bucket[value] = bucket.get(value, 0) + 1
+
+    for _, row in sheet.iterrows():
+        _bump("condition", str(row.get("condition", "")))
+        for k, v in _parse_characteristics(row.get("characteristics", "")).items():
+            _bump(k, v)
+    ordered = {
+        k: dict(sorted(v.items(), key=lambda kv: (-kv[1], kv[0])))
+        for k, v in sorted(fields.items())
+    }
+    return {"n_samples": int(len(sheet)), "condition_fields": ordered}
+
+
 def export_dataset(client: BioMinerClient, gse_id: str,
                    out_dir: Path) -> dict[str, Any]:
     """Download the ARCHS4 raw-count package for one series.
@@ -243,34 +273,59 @@ def local_analysis(client: BioMinerClient, gse_id: str, numerator: str,
                    organism: str = "Homo sapiens",
                    assay_type: str = "rna_seq",
                    register: bool = True,
-                   params: dict | None = None) -> dict[str, Any]:
-    """Chain the full download -> local analysis -> save pipeline."""
+                   params: dict | None = None,
+                   species: str | None = None,
+                   progress=None) -> dict[str, Any]:
+    """Chain the full download -> local analysis -> save pipeline.
+
+    ``species`` overrides the enrichment species; by default it follows the
+    export manifest's ``organism`` (the runner normalizes e.g. "Homo sapiens"
+    → human and honestly refuses unsupported species rather than
+    mis-annotating). ``progress`` is an optional ``callable(str)`` invoked at
+    each step so a CLI can show liveness during the multi-minute DE fit.
+    """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
+    def _say(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
+    _say(f"[1/6] exporting {gse_id} from the server ...")
     exported = export_dataset(client, gse_id, workdir / "export")
+    manifest_organism = str(exported["export"].get("organism") or organism)
+    _say(f"[2/6] building contrast {numerator!r} vs {denominator!r} "
+         f"(key={condition_key!r}) ...")
     contrast = build_contrast(exported, numerator, denominator,
                               workdir / "contrast", condition_key=condition_key,
                               condition_map=condition_map)
+    _say(f"[3/6] local DE on {contrast['n_samples']} samples "
+         "(pydeseq2 fit; this can take a few minutes) ...")
     de = run_de(contrast, workdir / "de", params)
 
     enrichments: dict[str, Any] = {}
     if enrichment:
+        _say("[4/6] fetching the frozen gene-set package ...")
         gene_sets = fetch_gene_sets(client, workdir / "gene_sets", libraries)
         library = libraries[0]
+        enrich_species = species or manifest_organism
         for kind in enrichment:
+            _say(f"[5/6] local {kind.upper()} ({library}, "
+                 f"species={enrich_species}) ...")
             enrichments[kind] = run_enrichment(
-                de, gene_sets, workdir / kind, kind=kind, library=library)
+                de, gene_sets, workdir / kind, kind=kind, library=library,
+                species=enrich_species)
 
     saved: dict[str, Any] | None = None
     if register:
+        _say("[6/6] registering study + uploading provenance/de_table ...")
         if study_id is None:
             study_id = client.call_tool("study_create", {
-                "body": {"organism": organism, "assay_type": assay_type,
+                "body": {"organism": manifest_organism, "assay_type": assay_type,
                          "title": f"{gse_id}: {numerator} vs {denominator}"},
                 "idempotency_key": _stable_key(
                     "study", gse_id, numerator, denominator, condition_key,
-                    organism, assay_type)})["study_id"]
+                    manifest_organism, assay_type)})["study_id"]
         saved = save_result(client, study_id, de, contrast)
 
     return {"gse_id": gse_id, "workdir": workdir, "export": exported["export"],

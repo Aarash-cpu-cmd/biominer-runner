@@ -16,8 +16,15 @@ study_create + upload_prepare ──票据──> provenance.json / de_table.tsv
 
 ## 认证
 
-客户端**不内置任何凭据**。令牌通过 `BIOMINER_TOKEN` 环境变量或 `--token-file`
-提供；`register` / `login` 会把令牌写入 `--token-file`（默认 `.biominer_token`，
+客户端**不内置任何凭据**。两条路径：
+
+**零账号（默认）**：没有令牌时，`export` / `conditions` / `run` / `save` 会自动
+向服务端铸造一枚**短命匿名凭据**（无需注册，权限与注册用户一致，云计算除外）。
+匿名凭据不落盘、到期/预算耗尽即自毁；服务端按稳定设备指纹 find-or-mint，
+重复运行仍落在同一 study 命名空间，幂等回放不受影响。
+
+**注册账号**：令牌通过 `BIOMINER_TOKEN` 环境变量或 `--token-file` 提供；
+`register` / `login` 会把令牌写入 `--token-file`（默认 `.biominer_token`，
 在支持的平台上设为仅属主可读），不会打印令牌。
 
 ```bash
@@ -31,17 +38,24 @@ biominer-client register --username alice --password '***'
 ## 命令行
 
 ```bash
+# 先看真实分组：列出 characteristics 各字段与取值样本数（零账号即可）
+biominer-client conditions --gse GSE52778
+
 # 仅下载某系列的原始整数 counts 与样本表（逐个校验 SHA-256）
 biominer-client export --gse GSE52778 --out work/export
 
-# 完整流程：下载 → 本机 DE + GSEA/ORA → 回传登记
-biominer-client run --gse GSE52778 \
+# 完整流程：下载 → 本机 DE + GSEA/ORA → 回传登记（进度打到 stderr）
+biominer-client run --gse GSE52778 --condition-key treatment \
     --numerator Dexamethasone --denominator Untreated \
     --out work/airway --libraries go_bp --enrichment gsea,ora
 
 # 只在本机分析、不回传
 biominer-client run --gse GSE52778 --numerator Dexamethasone \
     --denominator Untreated --out work/airway --no-register
+
+# 自定义分组：sample_id -> 标签 的 JSON 映射（覆盖表内标签）
+biominer-client run --gse GSE52778 --numerator case --denominator ctrl \
+    --condition-map my_groups.json --out work/custom
 
 # 把已有的本机产物回传登记
 biominer-client save --study-id study_xxx \
@@ -52,8 +66,14 @@ biominer-client save --study-id study_xxx \
 
 `run` 的分组标签默认从样本表 `characteristics` 里的 `treatment` 字段推导
 （可用 `--condition-key` 改字段名）；若样本表已带 `condition` 列则优先使用。
+**不知道字段名/标签时，先跑 `conditions`**——它按样本数列出每个字段的真实
+取值；选空组时错误信息会附带可用标签与 `conditions` 提示。
 客户端会按所选两组**子集化 counts**，使列与样本表逐一同序——这是 runner 的
 硬性输入约束（列错位会被结构化拒绝）。
+
+富集物种默认跟随导出 manifest 的 `organism`（当前 ARCHS4 本地源为人源，
+runner 将 "Homo sapiens" 归一为 human）；`--species` 可显式覆盖，不支持的
+物种会被 runner 诚实拒绝（SPECIES_UNSUPPORTED）而非错误注释。
 
 ## Python API
 
