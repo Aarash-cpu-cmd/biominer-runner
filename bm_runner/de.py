@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 PROFILE_ID = "bulk_wald_poscounts_raw_v1"
-PROFILE_VERSION = "1.0.0"
+PROFILE_VERSION = "1.1.0"  # fix round: canonical reduction order + stable MAP inference (F_C2)
 ENGINE = "pydeseq2"
 ENGINE_VERSION = "0.5.4"
 MIN_COUNTS = 10
@@ -76,16 +76,89 @@ def prefilter(counts: pd.DataFrame, *, min_counts: int = MIN_COUNTS,
     return filtered, stats
 
 
-def fit(counts: pd.DataFrame, conditions: pd.Series, numerator: str,
-        denominator: str, *, n_cpus: int = N_CPUS_DEFAULT) -> dict:
-    """Fit the frozen profile and return the raw result table plus details.
+def _make_inference(n_cpus: int):
+    """Noise-robust deterministic MAP inference (benchmark finding F_C2 fix).
 
-    ``counts`` is samples x genes (integer); ``conditions`` is indexed by the
-    same sample ids. ``numerator`` is the tested level and ``denominator`` is
-    the reference level.
+    pydeseq2 0.5.4's ``DefaultInference.alpha_mle`` delegates to
+    ``utils.fit_alpha_mle`` (scipy L-BFGS-B on the log-alpha NB posterior).
+    L-BFGS-B's line search is sensitive to ~1e-16 input noise: a benign
+    relabel that changes the design-matrix reduction order can flip its
+    convergence flag (7 genes on airway) and move the MAP estimate by ~1e-3,
+    cascading into lfc/pvalue/padj (findings F_C2 / I5-I7 failures).
+
+    This subclass keeps the EXACT same objective as ``utils.fit_alpha_mle.loss``
+    (nb_nll + Cox-Reid ``0.5*slogdet(X'WX)`` + log-residual prior
+    ``(log_a-log_alpha_hat)^2/(2*prior_disp_var)``) but minimizes it with a
+    deterministic bounded Brent search (``minimize_scalar(method="bounded",
+    xatol=1e-10)``) per gene. Brent stops on interval width, not on a
+    line-search gradient test, so ~1e-16 noise cannot move the result beyond
+    xatol and the convergence flag is stable. Genes are independent and
+    assembled in order (joblib), preserving gene-order determinism. The
+    ``grid_fit_alpha`` fallback is retained for the rare non-convergent case.
+    """
+    from joblib import Parallel, delayed, parallel_backend
+    from pydeseq2.default_inference import DefaultInference
+    from pydeseq2.utils import grid_fit_alpha, nb_nll
+    from scipy.optimize import minimize_scalar
+
+    def _map_one_gene(counts, design_matrix, mu, alpha_hat, min_disp, max_disp,
+                      prior_disp_var, cr_reg, prior_reg):
+        log_alpha_hat = np.log(alpha_hat)
+        lo, hi = np.log(min_disp), np.log(max_disp)
+
+        def loss(log_alpha):
+            alpha = np.exp(log_alpha)
+            reg = 0.0
+            if cr_reg:
+                W = mu / (1 + mu * alpha)
+                reg += 0.5 * np.linalg.slogdet((design_matrix.T * W) @ design_matrix)[1]
+            if prior_reg:
+                reg += (log_alpha - log_alpha_hat) ** 2 / (2 * prior_disp_var)
+            return float(nb_nll(counts, mu, alpha)) + reg
+
+        res = minimize_scalar(loss, bounds=(lo, hi), method="bounded",
+                              options={"xatol": 1e-10, "maxiter": 500})
+        if res.success:
+            return float(np.exp(res.x)), True
+        return float(np.exp(grid_fit_alpha(counts, design_matrix, mu, alpha_hat,
+                                           min_disp, max_disp))), False
+
+    class _StableInference(DefaultInference):
+        def alpha_mle(self, counts, design_matrix, mu, alpha_hat, min_disp, max_disp,
+                      prior_disp_var=None, cr_reg=True, prior_reg=False,
+                      optimizer="L-BFGS-B"):
+            with parallel_backend(self._backend, inner_max_num_threads=1):
+                res = Parallel(n_jobs=self.n_cpus, verbose=self._joblib_verbosity,
+                               batch_size=self._batch_size)(
+                    delayed(_map_one_gene)(
+                        counts[:, i], design_matrix, mu[:, i], alpha_hat[i],
+                        min_disp, max_disp, prior_disp_var, cr_reg, prior_reg)
+                    for i in range(counts.shape[1]))
+            res = zip(*res, strict=False)
+            dispersions_, converged_ = (np.array(m) for m in res)
+            return dispersions_, converged_
+
+    return _StableInference(n_cpus=int(n_cpus))
+
+
+def fit_core(counts: pd.DataFrame, conditions: pd.Series, numerator: str,
+             denominator: str, *, n_cpus: int = N_CPUS_DEFAULT):
+    """Shared frozen fit: canonical reduction order + stable MAP inference.
+
+    Returns ``(table, dds, stats, filter_stats, effective, nonfinite)``.
+    ``de.fit`` wraps this with the runner's result contract; the benchmark's
+    ``common.fit_capture`` calls the SAME core so the metamorphic/identity
+    tests exercise the shipped engine, not a divergent copy.
+
+    F_C2 fix — canonical reduction order: genes (columns) are sorted by ID and
+    samples (rows) by name before fitting, so every order-dependent float
+    reduction (the dispersion-trend gamma-GLM ``nanmean`` over genes, the NB
+    score sums over samples) sees a canonical operand order. A pure relabel or
+    row permutation therefore cannot inject ~1e-16 trend noise. The result
+    table is restored to the original post-prefilter gene order, so feature
+    order is preserved.
     """
     from pydeseq2.dds import DeseqDataSet
-    from pydeseq2.default_inference import DefaultInference
     from pydeseq2.ds import DeseqStats
 
     if not 1 <= int(n_cpus) <= N_CPUS_MAX:
@@ -96,20 +169,37 @@ def fit(counts: pd.DataFrame, conditions: pd.Series, numerator: str,
             f"no gene has count >= {MIN_COUNTS} in >= {MIN_SAMPLES} samples",
             {"gene_filter": filter_stats, "n_genes_input": int(counts.shape[1])})
 
-    # pydeseq2 0.5.x builds the design through formulaic, which uses the first
-    # categorical level as the baseline. Plain strings would pick an
-    # alphabetical baseline and could invert the coefficient if the tested
-    # level sorts before the reference. Put the reference first explicitly.
+    # F_C2 fix: canonical reduction order (genes by ID, samples by name).
+    orig_genes = filtered.columns
+    gene_order = np.argsort(orig_genes.to_numpy(), kind="stable")
+    sample_order = np.argsort(filtered.index.to_numpy(), kind="stable")
+    canon = filtered.iloc[sample_order, gene_order]
+
+    # F_C2 fix (I5 label-swap invariance): canonical contrast baseline. The two
+    # condition levels are ordered alphabetically for the INTERNAL fit, so a
+    # numerator/denominator swap reuses the IDENTICAL design parameterization
+    # and fit (bit-identical mu / dispersions / beta). The requested contrast
+    # direction is then applied as an EXACT sign flip on log2FoldChange and
+    # stat below (lfcSE, baseMean, pvalue, padj are direction-invariant). This
+    # removes the reparameterization noise that otherwise cascades
+    # genewise -> trend -> MAP under a baseline flip (c2_c: MoM ~1e-13 ->
+    # genewise max_rel 7.0 on a near-zero-dispersion gene -> MAP 3.4e-5).
+    # formulaic uses the first categorical level as the baseline; we fix it
+    # canonically rather than to the denominator so both directions share one
+    # numerical fit. The output contrast is still exactly numerator-vs-denominator.
+    levels = sorted([str(numerator), str(denominator)])
+    canon_den, canon_num = levels[0], levels[1]
+    cond = conditions.loc[canon.index]
     meta = pd.DataFrame({
         "condition": pd.Categorical(
-            conditions.astype(str),
-            categories=[denominator, numerator],
+            cond.astype(str),
+            categories=[canon_den, canon_num],
         )
-    }, index=conditions.index)
+    }, index=cond.index)
 
-    inference = DefaultInference(n_cpus=int(n_cpus))
+    inference = _make_inference(n_cpus)
     dds = DeseqDataSet(
-        counts=filtered,
+        counts=canon,
         metadata=meta,
         design="~condition",
         refit_cooks=bool(FIT_DEFAULTS["refit_cooks"]),
@@ -128,7 +218,7 @@ def fit(counts: pd.DataFrame, conditions: pd.Series, numerator: str,
 
     stats = DeseqStats(
         dds,
-        contrast=["condition", numerator, denominator],
+        contrast=["condition", canon_num, canon_den],
         alpha=float(STATS_DEFAULTS["alpha"]),
         cooks_filter=bool(STATS_DEFAULTS["cooks_filter"]),
         independent_filter=bool(STATS_DEFAULTS["independent_filter"]),
@@ -138,7 +228,14 @@ def fit(counts: pd.DataFrame, conditions: pd.Series, numerator: str,
         quiet=True,
     )
     stats.summary()
-    table = stats.results_df.copy()[list(CORE_COLUMNS)]
+    # Restore the original post-prefilter gene order (canonical sort was
+    # internal only); copy so the six columns stay independent of results_df.
+    table = stats.results_df.copy()[list(CORE_COLUMNS)].reindex(orig_genes)
+    # Apply the requested contrast direction as an exact sign flip when it is
+    # reversed relative to the canonical baseline (I5 invariance by construction).
+    if str(numerator) == canon_den:
+        table["log2FoldChange"] = -table["log2FoldChange"]
+        table["stat"] = -table["stat"]
 
     requested_fit = getattr(dds, "fit_type", None)
     effective_fit = dds.uns.get("disp_function_type") or requested_fit
@@ -159,6 +256,19 @@ def fit(counts: pd.DataFrame, conditions: pd.Series, numerator: str,
             "n_nan": int(np.isnan(values).sum()),
             "n_infinite": int(np.isinf(values).sum()),
         }
+    return table, dds, stats, filter_stats, effective, nonfinite
+
+
+def fit(counts: pd.DataFrame, conditions: pd.Series, numerator: str,
+        denominator: str, *, n_cpus: int = N_CPUS_DEFAULT) -> dict:
+    """Fit the frozen profile and return the raw result table plus details.
+
+    ``counts`` is samples x genes (integer); ``conditions`` is indexed by the
+    same sample ids. ``numerator`` is the tested level and ``denominator`` is
+    the reference level.
+    """
+    table, _dds, _stats, filter_stats, effective, nonfinite = fit_core(
+        counts, conditions, numerator, denominator, n_cpus=n_cpus)
     return {
         "table": table,
         "filter": filter_stats,
@@ -200,5 +310,8 @@ def profile_record() -> dict:
                            "lfc_threshold": LFC_THRESHOLD,
                            "lfc_basis": "raw"},
         "shrinkage": False,
+        "map_optimizer": "brent_bounded (xatol=1e-10, maxiter=500; grid_fit_alpha fallback)",
+        "canonical_reduction_order": True,
+        "fix_round": "F_C2: canonical gene/sample reduction order + noise-robust deterministic MAP",
         "n_cpus": {"default": N_CPUS_DEFAULT, "max": N_CPUS_MAX},
     }

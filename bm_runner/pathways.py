@@ -176,16 +176,27 @@ def _build_rank(de_table: pd.DataFrame, symbols: pd.Series | None,
     labels = _labels(de_table["gene"], symbols, species)
     # Series.reindex returns an index keyed by the gene ids, which would
     # misalign against the positional DE table index; build arrays instead.
-    frame = pd.DataFrame({"label": np.asarray(labels, dtype=str),
+    frame = pd.DataFrame({"gene": np.asarray(de_table["gene"], dtype=str),
+                          "label": np.asarray(labels, dtype=str),
                           "stat": stat.to_numpy(dtype="float64")})
     n_before = len(frame)
     frame = frame.dropna(subset=["stat"])
     frame = frame[frame["label"].ne("") & frame["label"].ne("NAN")]
-    frame = frame.sort_values(["stat", "label"], ascending=[False, True],
+    # F_D1 fix (FIX_ROUND_plan §5.2): choose the per-label representative by
+    # max |stat| with a gene-id tiebreak -- both invariant under contrast
+    # direction reversal (stat -> -stat). Sorting on signed stat made the kept
+    # gene flip when the direction reversed, so the GSEA ranking was not
+    # direction-covariant (finding F_D1). |stat| and gene-id are flip-invariant,
+    # so each label keeps the SAME representative gene under flip; the ranking
+    # becomes a pure reversal and ES/NES negate exactly. Final ranking is
+    # ordered by signed stat (prerank convention).
+    frame["_abs_stat"] = frame["stat"].abs()
+    frame = frame.sort_values(["_abs_stat", "gene"], ascending=[False, True],
                               kind="mergesort")
     duplicated = frame["label"].duplicated().sum()
     first = frame[~frame["label"].duplicated(keep="first")].copy()
-    rank = first.set_index("label")[["stat"]]
+    rank = first.set_index("label")[["stat"]].sort_values(
+        "stat", ascending=False, kind="mergesort")
     report = {
         "n_genes_in_de_table": int(n_before),
         "n_genes_after_dropna": int(len(frame)),
@@ -193,7 +204,7 @@ def _build_rank(de_table: pd.DataFrame, symbols: pd.Series | None,
         "n_duplicates_removed": int(duplicated),
         "dedup_rate": round(len(rank) / n_before, 4) if n_before else 0.0,
         "uppercase_applied": species == "human",
-        "dedup_strategy": "keep_first (highest rank)",
+        "dedup_strategy": "keep_first (max |stat|, gene-id tiebreak; direction-independent)",
     }
     return rank, report
 

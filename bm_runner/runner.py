@@ -38,7 +38,7 @@ import pandas as pd
 from . import de, figures, quant, report
 from .errors import Refusal
 
-RUNNER_VERSION = "2.1.1"
+RUNNER_VERSION = "2.2.0"
 PINNED_ENGINE = {"pydeseq2": de.ENGINE_VERSION}
 TRACKED_PACKAGES = ("pydeseq2", "pandas", "numpy", "anndata", "scipy", "psutil")
 MAX_GENES = 70_000
