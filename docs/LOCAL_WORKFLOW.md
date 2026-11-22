@@ -88,9 +88,15 @@ with BioMinerClient(token="...") as c:
     print(result["saved"]["register"]["result"]["result_id"])
 ```
 
+一键跑会把 DE 与 GSEA/ORA 结果都注册回服务端（富集结果挂在 DE 结果的
+`parent_result_id` 下），返回值的 `enrichment_results` 按 kind 给出各自回执。
+
 各步骤也可单独调用：`export_dataset`、`build_contrast`、`run_de`、
-`fetch_gene_sets`、`run_enrichment`、`save_result`。需要显式指定分组时用
+`fetch_gene_sets`、`run_enrichment`、`save_result`、`save_enrichment_result`。
+需要显式指定分组时用
 `build_contrast(..., condition_map={"GSM...": "treated", ...})`。
+直接用 Python API 时请给客户端配置 `receipt_cache`（CLI 默认已配），
+否则重跑会因票据变化触发服务端 CONFLICT 而非幂等回放。
 
 ## 真实示例（已在生产端跑通）
 

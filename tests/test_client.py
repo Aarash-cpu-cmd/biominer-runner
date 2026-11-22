@@ -614,3 +614,258 @@ def test_local_analysis_species_follows_manifest(monkeypatch, tmp_path):
     workflow.local_analysis(None, "GSE1", "x", "y", tmp_path / "w2",
                             register=False, species="human")
     assert captured == {"gsea": "human", "ora": "human"}
+
+
+# -- one-click run persists enrichment results --------------------------
+def test_local_analysis_registers_enrichments(monkeypatch, tmp_path):
+    monkeypatch.setattr(workflow, "export_dataset", lambda c, g, o: {
+        "export": {"organism": "Homo sapiens", "n_samples": 4},
+        "counts_path": tmp_path / "c.tsv", "sheet_path": tmp_path / "s.tsv"})
+    monkeypatch.setattr(workflow, "build_contrast",
+                        lambda *a, **k: {"n_samples": 4, "numerator": "x",
+                                         "denominator": "y"})
+    monkeypatch.setattr(workflow, "run_de",
+                        lambda *a, **k: {"de_table_path": tmp_path / "de.tsv"})
+    monkeypatch.setattr(workflow, "fetch_gene_sets",
+                        lambda *a, **k: {"go_bp": {}})
+    monkeypatch.setattr(workflow, "run_enrichment",
+                        lambda de, gs, out, *, kind, library, species:
+                        {"kind": kind, "dir": out, "library": library})
+    monkeypatch.setattr(workflow, "save_result",
+                        lambda *a, **k: {"register": {"result": {
+                            "result_id": "lres_de1"}}})
+    calls = []
+
+    def fake_save_enrich(client, study_id, enr, contrast, *, parent_result_id):
+        calls.append((study_id, enr["kind"], parent_result_id))
+        return {"register": {"result": {"result_id": "lres_" + enr["kind"]}}}
+
+    monkeypatch.setattr(workflow, "save_enrichment_result", fake_save_enrich)
+    out = workflow.local_analysis(None, "GSE1", "x", "y", tmp_path / "w",
+                                  study_id="study_1", register=True)
+    assert calls == [("study_1", "gsea", "lres_de1"),
+                     ("study_1", "ora", "lres_de1")]
+    assert set(out["enrichment_results"]) == {"gsea", "ora"}
+    assert out["saved"]["register"]["result"]["result_id"] == "lres_de1"
+
+
+def test_local_analysis_skips_enrichment_upload_without_parent(monkeypatch,
+                                                               tmp_path):
+    # A DE registration that yields no result_id must not orphan pathway
+    # results (the server requires a parent DE digest cross-check).
+    monkeypatch.setattr(workflow, "export_dataset", lambda c, g, o: {
+        "export": {"organism": "Homo sapiens", "n_samples": 4},
+        "counts_path": tmp_path / "c.tsv", "sheet_path": tmp_path / "s.tsv"})
+    monkeypatch.setattr(workflow, "build_contrast",
+                        lambda *a, **k: {"n_samples": 4, "numerator": "x",
+                                         "denominator": "y"})
+    monkeypatch.setattr(workflow, "run_de",
+                        lambda *a, **k: {"de_table_path": tmp_path / "de.tsv"})
+    monkeypatch.setattr(workflow, "fetch_gene_sets",
+                        lambda *a, **k: {"go_bp": {}})
+    monkeypatch.setattr(workflow, "run_enrichment",
+                        lambda de, gs, out, *, kind, library, species:
+                        {"kind": kind, "dir": out, "library": library})
+    monkeypatch.setattr(workflow, "save_result",
+                        lambda *a, **k: {"register": {}})
+
+    def boom(*a, **k):
+        raise AssertionError("must not upload without a parent result")
+
+    monkeypatch.setattr(workflow, "save_enrichment_result", boom)
+    out = workflow.local_analysis(None, "GSE1", "x", "y", tmp_path / "w",
+                                  study_id="study_1", register=True)
+    assert out["enrichment_results"] == {}
+
+
+# -- save_enrichment_result (gsea/ora upload) ---------------------------
+def _enrichment_fixture(tmp_path, kind="gsea"):
+    gdir = tmp_path / kind
+    gdir.mkdir()
+    # mirror bm_runner's on-disk names: GSEA -> provenance.json,
+    # ORA -> ora_provenance.json
+    prov = gdir / ("provenance.json" if kind == "gsea"
+                   else "ora_provenance.json")
+    prov.write_text(json.dumps({
+        "schema": "bm_local_pathway_v1", "result_kind": kind,
+        "engine": "gseapy" if kind == "gsea" else "statsmodels",
+        "params": {"library": "go_bp"}}))
+    table = gdir / ("gsea_results.tsv" if kind == "gsea" else "ora_results.tsv")
+    table.write_text("Term\tNES\tFDR q-val\nGO:1\t2.3\t0.001\n")
+    return {"kind": kind, "dir": gdir, "library": "go_bp"}
+
+
+def test_save_enrichment_result_uploads_and_registers(tmp_path):
+    enr = _enrichment_fixture(tmp_path)
+    calls = {}
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/upload_prepare"):
+            body = json.loads(request.content)
+            calls.setdefault("uploads", []).append(body["filename"])
+            return httpx.Response(200, json=_envelope({"ticket": {
+                "ticket_id": "upt", "upload_url": "https://example.test/ul/u"}}))
+        if path.endswith("/ul/u"):
+            return httpx.Response(200, json={"data": {"receipt": {
+                "receipt_id": "urc_" + str(len(calls["uploads"]))}}})
+        if path.endswith("/local_result_register"):
+            calls["register"] = json.loads(request.content)
+            return httpx.Response(200, json=_envelope({"result": {
+                "result_id": "lres_g1", "result_kind": "gsea"}}))
+        raise AssertionError(f"unexpected {path}")
+
+    with _client(handler) as c:
+        saved = workflow.save_enrichment_result(
+            c, "study_1", enr,
+            {"numerator": "Dexamethasone", "denominator": "Untreated"},
+            parent_result_id="lres_de1", idempotency_key="fixed")
+    assert saved["register"]["result"]["result_id"] == "lres_g1"
+    # provenance is cache-namespaced by kind so it cannot cross-wire with
+    # the DE provenance (both are "provenance.json" on disk)
+    assert calls["uploads"] == ["gsea_provenance.json", "gsea_results.tsv"]
+    reg = calls["register"]
+    assert reg["result_kind"] == "gsea"
+    assert reg["parent_result_id"] == "lres_de1"
+    assert reg["study_id"] == "study_1"
+    assert reg["idempotency_key"] == "fixed"
+    assert reg["pathway_table_receipt_id"] and reg["provenance_receipt_id"]
+    assert "de_table_receipt_id" not in reg
+
+
+def test_save_enrichment_result_ora_uses_ora_table(tmp_path):
+    enr = _enrichment_fixture(tmp_path, kind="ora")
+    calls = {}
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/upload_prepare"):
+            body = json.loads(request.content)
+            calls.setdefault("uploads", []).append(body["filename"])
+            return httpx.Response(200, json=_envelope({"ticket": {
+                "ticket_id": "upt", "upload_url": "https://example.test/ul/u"}}))
+        if path.endswith("/ul/u"):
+            return httpx.Response(200, json={"data": {"receipt": {
+                "receipt_id": "urc_" + str(len(calls["uploads"]))}}})
+        if path.endswith("/local_result_register"):
+            calls["register"] = json.loads(request.content)
+            return httpx.Response(200, json=_envelope({"result": {
+                "result_id": "lres_o1", "result_kind": "ora"}}))
+        raise AssertionError(f"unexpected {path}")
+
+    with _client(handler) as c:
+        workflow.save_enrichment_result(
+            c, "study_1", enr, {"numerator": "A", "denominator": "B"},
+            parent_result_id="lres_de1")
+    assert calls["uploads"] == ["ora_provenance.json", "ora_results.tsv"]
+    assert calls["register"]["result_kind"] == "ora"
+
+
+def test_save_enrichment_result_key_ignores_volatile_fields(tmp_path):
+    enr = _enrichment_fixture(tmp_path)
+    prov = enr["dir"] / "provenance.json"
+    keys = []
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/upload_prepare"):
+            return httpx.Response(200, json=_envelope({"ticket": {
+                "ticket_id": "upt", "upload_url": "https://example.test/ul/u"}}))
+        if path.endswith("/ul/u"):
+            return httpx.Response(200, json={"data": {"receipt": {
+                "receipt_id": "urc_x"}}})
+        if path.endswith("/local_result_register"):
+            keys.append(json.loads(request.content)["idempotency_key"])
+            return httpx.Response(200, json=_envelope({"result": {
+                "result_id": "lres_g1"}}))
+        raise AssertionError(f"unexpected {path}")
+
+    base = json.loads(prov.read_text())
+    contrast = {"numerator": "A", "denominator": "B"}
+    with _client(handler) as c:
+        prov.write_text(json.dumps(dict(base, created_at="t1",
+                                        metrics={"elapsed_s": 1.0})))
+        workflow.save_enrichment_result(c, "study_1", enr, contrast,
+                                        parent_result_id="lres_de1")
+        prov.write_text(json.dumps(dict(base, created_at="t2",
+                                        metrics={"elapsed_s": 99.0})))
+        workflow.save_enrichment_result(c, "study_1", enr, contrast,
+                                        parent_result_id="lres_de1")
+        # a genuinely different table must produce a different key
+        (enr["dir"] / "gsea_results.tsv").write_text(
+            "Term\tNES\tFDR q-val\nGO:2\t-1.9\t0.02\n")
+        workflow.save_enrichment_result(c, "study_1", enr, contrast,
+                                        parent_result_id="lres_de1")
+    assert keys[0] == keys[1]
+    assert keys[2] != keys[0]
+
+
+def test_save_enrichment_result_rejects_unknown_kind(tmp_path):
+    enr = _enrichment_fixture(tmp_path)
+    enr["kind"] = "ssgsea"
+    with _client(lambda r: None) as c:
+        with pytest.raises(ValueError, match="unsupported enrichment kind"):
+            workflow.save_enrichment_result(
+                c, "study_1", enr, {"numerator": "A", "denominator": "B"},
+                parent_result_id="lres_de1")
+
+
+def test_save_enrichment_result_conflict_recovers(tmp_path):
+    # Same bug-#12 migration recovery as DE: the key is bound to an older
+    # provenance receipt; a semantic-content change uploads a new receipt,
+    # the server CONFLICTs, and the client replays with the cached original.
+    cache = tmp_path / "receipts.json"
+    uploads = []
+    bindings = {}
+    registers = []
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/upload_prepare"):
+            return httpx.Response(200, json=_envelope({"ticket": {
+                "ticket_id": "upt", "upload_url": "https://example.test/ul/u"}}))
+        if path.endswith("/ul/u"):
+            uploads.append(1)
+            return httpx.Response(200, json={"data": {"receipt": {
+                "receipt_id": f"urc_{len(uploads)}"}}})
+        if path.endswith("/local_result_register"):
+            body = json.loads(request.content)
+            registers.append(body)
+            key = body["idempotency_key"]
+            sig = (body["provenance_receipt_id"],
+                   body["pathway_table_receipt_id"])
+            if key not in bindings:
+                bindings[key] = sig
+                return httpx.Response(200, json=_envelope({"result": {
+                    "result_id": "lres_g1"}, "replayed": False}))
+            if bindings[key] == sig:
+                return httpx.Response(200, json=_envelope({"result": {
+                    "result_id": "lres_g1"}, "replayed": True}))
+            return httpx.Response(200, json=_envelope(
+                ok=False, error={"code": "CONFLICT",
+                                 "message": "idempotency key is already "
+                                            "bound to a different request"}))
+        raise AssertionError(f"unexpected {path}")
+
+    def mk():
+        return BioMinerClient(base_url="https://example.test", token="t",
+                              transport=httpx.MockTransport(handler),
+                              receipt_cache=cache)
+
+    enr = _enrichment_fixture(tmp_path)
+    prov = enr["dir"] / "provenance.json"
+    contrast = {"numerator": "A", "denominator": "B"}
+    base = json.loads(prov.read_text())
+    with mk() as c:
+        workflow.save_enrichment_result(c, "study_1", enr, contrast,
+                                        parent_result_id="lres_de1",
+                                        idempotency_key="fixed")
+    # semantic content change -> new provenance receipt -> CONFLICT
+    prov.write_text(json.dumps(dict(base, params={"library": "hallmark"})))
+    with mk() as c:
+        saved = workflow.save_enrichment_result(
+            c, "study_1", enr, contrast,
+            parent_result_id="lres_de1", idempotency_key="fixed")
+    assert saved["register"]["replayed"] is True
+    assert saved["provenance_receipt_id"] == "urc_1"
+    assert registers[-1]["provenance_receipt_id"] == "urc_1"

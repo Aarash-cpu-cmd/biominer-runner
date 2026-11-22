@@ -264,7 +264,10 @@ def save_result(client: BioMinerClient, study_id: str,
     """Upload provenance + de_table and register the local result.
 
     The server validates the provenance schema and stores the bytes; it
-    does not recompute or endorse the statistics.
+    does not recompute or endorse the statistics. Configure the client
+    with a ``receipt_cache`` (the CLI does this by default) so re-runs
+    reuse the original receipts and the server replays instead of
+    refusing the re-bound idempotency key with CONFLICT.
     """
     prov_semantic = _provenance_semantic_sha(de["provenance_path"])
     prov_receipt = client.upload_file(Path(de["provenance_path"]),
@@ -315,6 +318,85 @@ def save_result(client: BioMinerClient, study_id: str,
     return {"register": data,
             "provenance_receipt_id": prov_receipt["receipt_id"],
             "de_table_receipt_id": de_receipt["receipt_id"]}
+
+
+def save_enrichment_result(client: BioMinerClient, study_id: str,
+                           enrichment: dict[str, Any],
+                           contrast: dict[str, Any], *,
+                           parent_result_id: str,
+                           idempotency_key: str | None = None) -> dict[str, Any]:
+    """Upload pathway provenance + table and register a gsea/ora result.
+
+    The server cross-checks the provenance against the parent DE digest
+    and the uploaded table bytes, then stores them; it does not recompute
+    or endorse the statistics. ``enrichment`` is one value of the dict
+    returned by :func:`run_enrichment` (``kind``, ``dir``, ``library``).
+    As with :func:`save_result`, configure a ``receipt_cache`` on the
+    client so re-runs replay instead of hitting a CONFLICT.
+    """
+    kind = enrichment["kind"]
+    if kind not in ("gsea", "ora"):
+        raise ValueError(f"unsupported enrichment kind: {kind!r}")
+    gdir = Path(enrichment["dir"])
+    # bm_runner names the pathway provenance per kind: GSEA writes
+    # provenance.json, ORA writes ora_provenance.json.
+    prov_path = gdir / ("provenance.json" if kind == "gsea"
+                        else "ora_provenance.json")
+    table_path = gdir / ("gsea_results.tsv" if kind == "gsea"
+                         else "ora_results.tsv")
+    prov_semantic = _provenance_semantic_sha(prov_path)
+    # Namespace the receipt cache by kind: DE and pathway provenance share
+    # the on-disk filename "provenance.json"; a shared cache name would
+    # cross-wire the bug-#12 CONFLICT recovery between result kinds.
+    prov_name = f"{kind}_provenance.json"
+    prov_receipt = client.upload_bytes(prov_name, prov_path.read_bytes(),
+                                       semantic_sha=prov_semantic)
+    tab_receipt = client.upload_file(table_path)
+    if idempotency_key is None:
+        # Semantic provenance hash (volatile created_at/metrics excluded) +
+        # pathway table bytes: stable across re-runs of the same contrast
+        # and library, so the server replays instead of duplicating.
+        idempotency_key = _stable_key(
+            "lr", study_id, contrast["numerator"], contrast["denominator"],
+            kind, enrichment.get("library", ""), prov_semantic,
+            _file_sha(table_path))
+
+    def _register(prov: dict, tab: dict) -> dict:
+        return client.call_tool("local_result_register", {
+            "study_id": study_id,
+            "contrast": {"numerator": contrast["numerator"],
+                         "denominator": contrast["denominator"]},
+            "result_kind": kind,
+            "parent_result_id": parent_result_id,
+            "pathway_table_receipt_id": tab["receipt_id"],
+            "provenance_receipt_id": prov["receipt_id"],
+            "idempotency_key": idempotency_key})
+
+    try:
+        data = _register(prov_receipt, tab_receipt)
+    except BioMinerError as exc:
+        if exc.code != "CONFLICT":
+            raise
+        # Same migration recovery as save_result (bug #12): the key is
+        # bound to an earlier body; replay with the original receipts.
+        data = None
+        for old_prov in client.cached_receipts(prov_name):
+            if old_prov["receipt_id"] == prov_receipt["receipt_id"]:
+                continue
+            try:
+                data = _register(old_prov, tab_receipt)
+                prov_receipt = old_prov
+                client.rebind_semantic_receipt(
+                    prov_name, prov_semantic, old_prov)
+                break
+            except BioMinerError as retry_exc:
+                if retry_exc.code != "CONFLICT":
+                    raise
+        if data is None:
+            raise
+    return {"register": data,
+            "provenance_receipt_id": prov_receipt["receipt_id"],
+            "pathway_table_receipt_id": tab_receipt["receipt_id"]}
 
 
 def local_analysis(client: BioMinerClient, gse_id: str, numerator: str,
@@ -371,8 +453,11 @@ def local_analysis(client: BioMinerClient, gse_id: str, numerator: str,
                 species=enrich_species)
 
     saved: dict[str, Any] | None = None
+    enrichment_saved: dict[str, Any] = {}
     if register:
-        _say("[6/6] registering study + uploading provenance/de_table ...")
+        _say("[6/6] registering study + uploading DE/provenance"
+             + (f" + {'/'.join(enrichments)} results" if enrichments else "")
+             + " ...")
         if study_id is None:
             study_id = client.call_tool("study_create", {
                 "body": {"organism": manifest_organism, "assay_type": assay_type,
@@ -381,7 +466,15 @@ def local_analysis(client: BioMinerClient, gse_id: str, numerator: str,
                     "study", gse_id, numerator, denominator, condition_key,
                     manifest_organism, assay_type)})["study_id"]
         saved = save_result(client, study_id, de, contrast)
+        # Persist the enrichment results too: a one-click run that computes
+        # GSEA/ORA but leaves them only on disk loses the biology on refresh.
+        parent = ((saved.get("register") or {}).get("result") or {}).get("result_id")
+        if parent:
+            for name, enr in enrichments.items():
+                enrichment_saved[name] = save_enrichment_result(
+                    client, study_id, enr, contrast, parent_result_id=parent)
 
     return {"gse_id": gse_id, "workdir": workdir, "export": exported["export"],
             "contrast": contrast, "de": de, "enrichments": enrichments,
-            "study_id": study_id, "saved": saved}
+            "study_id": study_id, "saved": saved,
+            "enrichment_results": enrichment_saved}

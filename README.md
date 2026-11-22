@@ -106,7 +106,7 @@ runner 只接受冻结支持矩阵内的分析（V1：两组、非配对、无�
 # 零账号一键跑：无令牌时自动铸造短命匿名凭据（无需注册，权限与注册用户一致，云计算除外）
 # 先看真实分组字段与取值样本数，再选对比
 biominer-client conditions --gse GSE52778
-# 下载 → 本机 DE/GSEA/ORA → 回传登记
+# 下载 → 本机 DE/GSEA/ORA → 回传登记（DE 与 GSEA/ORA 结果都会注册，富集结果挂在 DE 结果下）
 # 重复运行同一对比会幂等回放（replayed=true），不产生重复 study/结果
 biominer-client run --gse GSE52778 --condition-key treatment \
     --numerator Dexamethasone --denominator Untreated --out work/airway \
